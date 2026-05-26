@@ -1,0 +1,49 @@
+{
+  "name": "synapse",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "acceptance": "node --import tsx ./scripts/acceptance.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^3.0.65",
+    "@ai-sdk/react": "^3.0.192",
+    "@tencentdb-agent-memory/memory-tencentdb": "^0.3.5",
+    "@xyflow/react": "^12.10.2",
+    "ai": "^6.0.190",
+    "autoprefixer": "^10.5.0",
+    "better-sqlite3": "^12.10.0",
+    "jszip": "^3.10.1",
+    "mammoth": "^1.12.0",
+    "next": "14.2.30",
+    "next-auth": "^4.24.14",
+    "node-llama-cpp": "^3.18.1",
+    "pdfjs-dist": "^5.7.284",
+    "postcss": "^8.5.15",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-markdown": "^10.1.0",
+    "tailwindcss": "^4.3.0",
+    "xlsx": "^0.18.5",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "6.6.3",
+    "@testing-library/react": "16.0.1",
+    "@testing-library/user-event": "14.5.2",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "22.10.1",
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "jsdom": "25.0.1",
+    "tsx": "4.19.2",
+    "typescript": "5.7.2",
+    "vitest": "2.1.8"
+  }
+}

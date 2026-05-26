@@ -9,7 +9,7 @@
  *               priority L1 memories. Used by the mock/preview page.
  */
 import { NextRequest, NextResponse } from "next/server";
-import { getAhaLast, forceGenerateAha } from "@/lib/memory/aha";
+import { getAhaLast, forceGenerateAha, isAhaLastSeen } from "@/lib/memory/aha";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,11 +20,12 @@ export async function GET(req: NextRequest) {
   if (force) {
     const fresh = await forceGenerateAha();
     if (!fresh) {
-      return NextResponse.json({ aha: null, reason: "no_memories_or_generation_failed" });
+      return NextResponse.json({ aha: null, unseen: false, reason: "no_memories_or_generation_failed" });
     }
-    return NextResponse.json({ aha: fresh, source: "force" });
+    return NextResponse.json({ aha: fresh, unseen: true, source: "force" });
   }
 
   const aha = getAhaLast();
-  return NextResponse.json({ aha, source: aha ? "cached" : "none" });
+  const unseen = aha ? !isAhaLastSeen() : false;
+  return NextResponse.json({ aha, unseen, source: aha ? "cached" : "none" });
 }

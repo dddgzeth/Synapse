@@ -11,6 +11,7 @@
 
 import { useState } from "react";
 import type { SelectedDetail, ConversationPayload } from "./evidence-graph";
+import { useI18n } from "./i18n";
 
 interface Props {
   detail: SelectedDetail | null;
@@ -18,6 +19,7 @@ interface Props {
 }
 
 export function EvidenceDrawer({ detail, onClose }: Props) {
+  const { t } = useI18n();
   if (!detail) return null;
 
   return (
@@ -44,8 +46,8 @@ export function EvidenceDrawer({ detail, onClose }: Props) {
           fontSize: 11, fontWeight: 700, color: "#666",
           textTransform: "uppercase", letterSpacing: 0.7,
         }}>
-          {detail.kind === "top" && "✨ Synapse 注意到"}
-          {detail.kind === "scene" && "📂 主题场景"}
+          {detail.kind === "top" && `✨ ${t.aha.noticed}`}
+          {detail.kind === "scene" && `📂 ${t.aha.scene}`}
           {detail.kind === "memory" && `📝 ${detail.memory.type}`}
         </span>
         <button onClick={onClose} style={closeBtnStyle}>✕</button>
@@ -64,15 +66,16 @@ export function EvidenceDrawer({ detail, onClose }: Props) {
 }
 
 function TopDetail({ detail }: { detail: Extract<SelectedDetail, { kind: "top" }> }) {
+  const { t, locale } = useI18n();
   const { aha } = detail;
   return (
     <>
-      <Section label="叙事">{aha.observation}</Section>
-      <Section label="假说">{aha.hypothesis}</Section>
-      <Section label="重新理解">{aha.reframe}</Section>
-      <Section label="检测时间">
+      <Section label={t.aha.narrative}>{aha.observation}</Section>
+      <Section label={t.aha.hypothesis}>{aha.hypothesis}</Section>
+      <Section label={t.aha.reframe}>{aha.reframe}</Section>
+      <Section label={t.aha.detectedAt}>
         <span style={{ color: "#888", fontSize: 12 }}>
-          {new Date(aha.detectedAt).toLocaleString("zh-CN")}
+          {new Date(aha.detectedAt).toLocaleString(locale)}
         </span>
       </Section>
     </>
@@ -80,38 +83,40 @@ function TopDetail({ detail }: { detail: Extract<SelectedDetail, { kind: "top" }
 }
 
 function SceneDetail({ detail }: { detail: Extract<SelectedDetail, { kind: "scene" }> }) {
+  const { t } = useI18n();
   const { scene } = detail;
   return (
     <>
       <h3 style={{ fontSize: 16, fontWeight: 700, margin: "0 0 10px", color: "#1f3c66" }}>
         {scene.title}
       </h3>
-      <Section label="摘要">{scene.summary}</Section>
+      <Section label={t.aha.summary}>{scene.summary}</Section>
       <div style={{ display: "flex", gap: 10, marginTop: 6 }}>
-        <Stat label="支撑记忆" value={`${scene.memoryCount} 条`} />
-        <Stat label="最高优先级" value={`P${scene.maxPriority}`} />
+        <Stat label={t.aha.supportingMemories} value={`${scene.memoryCount} ${t.common.memories}`} />
+        <Stat label={t.aha.maxPriority} value={`P${scene.maxPriority}`} />
       </div>
     </>
   );
 }
 
 function MemoryDetail({ detail }: { detail: Extract<SelectedDetail, { kind: "memory" }> }) {
+  const { t, locale } = useI18n();
   const { memory, conversations } = detail;
   return (
     <>
       <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
-        <Stat label="类型" value={memory.type} />
-        <Stat label="优先级" value={`P${memory.priority}`} />
-        <Stat label="创建" value={new Date(memory.createdAt).toLocaleDateString("zh-CN")} />
+        <Stat label={t.aha.type} value={memory.type} />
+        <Stat label={t.aha.priority} value={`P${memory.priority}`} />
+        <Stat label={t.aha.created} value={new Date(memory.createdAt).toLocaleDateString(locale)} />
       </div>
 
-      <Section label="L1 内容">
+      <Section label={t.details.l1Content}>
         <div style={{ whiteSpace: "pre-wrap", color: "#222" }}>{memory.content}</div>
       </Section>
 
-      <Section label={`原始对话（L0 · ${conversations.length} 条）`}>
+      <Section label={t.details.l0Conversation(conversations.length)}>
         {conversations.length === 0 ? (
-          <em style={{ color: "#999" }}>(无可关联的 L0 消息)</em>
+          <em style={{ color: "#999" }}>{t.details.noL0}</em>
         ) : (
           conversations.map((c, i) => <L0Bubble key={i} conv={c} />)
         )}
@@ -123,6 +128,7 @@ function MemoryDetail({ detail }: { detail: Extract<SelectedDetail, { kind: "mem
 const COLLAPSED_LEN = 300;
 
 function L0Bubble({ conv }: { conv: ConversationPayload }) {
+  const { t, locale } = useI18n();
   const isUser = conv.role === "user";
   const long = conv.content.length > COLLAPSED_LEN;
   const [expanded, setExpanded] = useState(!long || isUser); // user 默认全显示
@@ -144,7 +150,7 @@ function L0Bubble({ conv }: { conv: ConversationPayload }) {
           {isUser ? "User" : "Synapse"}
         </span>
         <span style={{ fontSize: 10 }}>
-          {new Date(conv.recorded_at).toLocaleString("zh-CN", {
+          {new Date(conv.recorded_at).toLocaleString(locale, {
             month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit",
           })}
         </span>
@@ -160,7 +166,7 @@ function L0Bubble({ conv }: { conv: ConversationPayload }) {
             color: "#3a6ea5", cursor: "pointer", fontSize: 11, padding: 0, fontWeight: 600,
           }}
         >
-          {expanded ? "收起 ▲" : `展开剩余 ${conv.content.length - COLLAPSED_LEN} 字 ▼`}
+          {expanded ? t.aha.collapse : t.aha.expandRemaining(conv.content.length - COLLAPSED_LEN)}
         </button>
       )}
     </div>

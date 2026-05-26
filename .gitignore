@@ -1,0 +1,18 @@
+.next
+coverage
+node_modules
+dist
+*.log
+
+.DS_Store
+.env
+.env.*
+!.env.example
+
+data/
+_archive/
+Weekly Progress Report/
+screenshot/
+.agents/
+.claude/
+tsconfig.tsbuildinfo

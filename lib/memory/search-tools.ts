@@ -183,6 +183,62 @@ export function formatSearchResponse(result: MemorySearchResult): string {
 }
 
 // ============================
+// Web search + URL fetch
+// ============================
+
+export async function executeWebSearch(query: string): Promise<string> {
+  const apiKey = process.env.TAVILY_API_KEY;
+  if (!apiKey) return "web_search unavailable: TAVILY_API_KEY not configured.";
+  try {
+    const resp = await fetch("https://api.tavily.com/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: apiKey,
+        query,
+        search_depth: "basic",
+        max_results: 6,
+        include_answer: true,
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) return `Search failed: HTTP ${resp.status}`;
+    const data = await resp.json();
+    const lines: string[] = [];
+    if (data.answer) lines.push(`**Summary:** ${data.answer}\n`);
+    for (const r of (data.results ?? []) as Array<{ title: string; url: string; content: string }>) {
+      lines.push(`**${r.title}**\n${r.url}\n${r.content?.slice(0, 300) ?? ""}`);
+    }
+    return lines.length > 0 ? lines.join("\n\n") : "No results found.";
+  } catch (err: any) {
+    return `Search error: ${err?.message ?? String(err)}`;
+  }
+}
+
+export async function executeFetchUrl(url: string): Promise<string> {
+  try {
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "Synapse/1.0" },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!resp.ok) return `HTTP ${resp.status} ${resp.statusText} — page not found or inaccessible.`;
+    const contentType = resp.headers.get("content-type") ?? "";
+    if (!contentType.includes("text")) return `Non-text content (${contentType}), cannot display.`;
+    const raw = await resp.text();
+    const text = raw
+      .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+      .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+      .replace(/<[^>]+>/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 10_000);
+    return text || "(empty page)";
+  } catch (err: any) {
+    return `Fetch error: ${err?.message ?? String(err)}`;
+  }
+}
+
+// ============================
 // AI SDK 6 tool factory
 // ============================
 
@@ -195,6 +251,28 @@ export function formatSearchResponse(result: MemorySearchResult): string {
  */
 export function buildChatTools() {
   return {
+    web_search: tool({
+      description:
+        "Search the web via DuckDuckGo. Use when the user asks about external information, " +
+        "wants to find a GitHub repo, paper, tool, or any public resource. " +
+        "Returns titles, URLs, and snippets. After searching, use fetch_url to read the actual page.",
+      inputSchema: z.object({
+        query: z.string().describe("Search query, e.g. 'BAMresearch MINERVA github' or 'FAIR data chemotion ELN'"),
+      }),
+      execute: async ({ query }) => executeWebSearch(query),
+    }),
+
+    fetch_url: tool({
+      description:
+        "Fetch and read the text content of a URL. Use to: verify a link exists, " +
+        "read a GitHub README, fetch a paper abstract page, check a DOI landing page. " +
+        "Returns up to 10k chars of page text. If the page returns HTTP 404/403, the link is invalid.",
+      inputSchema: z.object({
+        url: z.string().describe("Full URL to fetch, e.g. 'https://github.com/BAMresearch/MINERVA'"),
+      }),
+      execute: async ({ url }) => executeFetchUrl(url),
+    }),
+
     tdai_conversation_search: tool({
       description:
         "Search the user's stored RAW CONVERSATION history (L0) by keywords. " +

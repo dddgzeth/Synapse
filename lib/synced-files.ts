@@ -18,16 +18,19 @@ import { getCachedPdfText, putCachedPdfText } from "./synced-files-cache";
 
 export interface SyncedFileEntry {
   path: string;          // e.g. "ELN/Murray-Rust 1999.pdf"
-  kind: "text" | "pdf" | "unsupported";
+  kind: "text" | "pdf" | "docx" | "pptx" | "xlsx" | "unsupported";
   size: number;          // bytes (from file.size)
   mtime: number;         // epoch ms (from file.lastModified)
 }
 
 const TEXT_EXTS = [".txt", ".md", ".tex", ".rst", ".csv", ".json", ".yaml", ".yml"];
 
-function classifyKind(name: string): SyncedFileEntry["kind"] {
+export function classifyKind(name: string): SyncedFileEntry["kind"] {
   const lower = name.toLowerCase();
   if (lower.endsWith(".pdf")) return "pdf";
+  if (lower.endsWith(".docx")) return "docx";
+  if (lower.endsWith(".pptx")) return "pptx";
+  if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) return "xlsx";
   if (TEXT_EXTS.some((e) => lower.endsWith(e))) return "text";
   return "unsupported";
 }
@@ -123,8 +126,7 @@ export async function readSyncedFileContent(
   let text: string;
   if (kind === "text") {
     text = await file.text();
-  } else {
-    // pdf
+  } else if (kind === "pdf") {
     const cached = await getCachedPdfText(path, file.lastModified).catch(() => null);
     if (cached !== null) {
       text = cached;
@@ -132,6 +134,32 @@ export async function readSyncedFileContent(
       text = await parsePdfToText(file);
       await putCachedPdfText(path, file.lastModified, text).catch(() => {});
     }
+  } else if (kind === "docx") {
+    const cached = await getCachedPdfText(path, file.lastModified).catch(() => null);
+    if (cached !== null) {
+      text = cached;
+    } else {
+      text = await parseDocxToText(file);
+      await putCachedPdfText(path, file.lastModified, text).catch(() => {});
+    }
+  } else if (kind === "pptx") {
+    const cached = await getCachedPdfText(path, file.lastModified).catch(() => null);
+    if (cached !== null) {
+      text = cached;
+    } else {
+      text = await parsePptxToText(file);
+      await putCachedPdfText(path, file.lastModified, text).catch(() => {});
+    }
+  } else if (kind === "xlsx") {
+    const cached = await getCachedPdfText(path, file.lastModified).catch(() => null);
+    if (cached !== null) {
+      text = cached;
+    } else {
+      text = await parseXlsxToText(file);
+      await putCachedPdfText(path, file.lastModified, text).catch(() => {});
+    }
+  } else {
+    text = "";
   }
 
   const truncated = text.length > maxChars;
@@ -144,7 +172,7 @@ export async function readSyncedFileContent(
   };
 }
 
-async function parsePdfToText(file: File): Promise<string> {
+export async function parsePdfToText(file: File): Promise<string> {
   // Lazy import to keep initial bundle small.
   const pdfjs = await import("pdfjs-dist");
   // Tell pdfjs where the worker is. Vite/webpack handles this transform.
@@ -164,4 +192,90 @@ async function parsePdfToText(file: File): Promise<string> {
     parts.push(`--- Page ${i} ---\n${pageText}`);
   }
   return parts.join("\n\n");
+}
+
+// ─────────────────────────────────────────
+// Office documents — all lazy-loaded for bundle size.
+// ─────────────────────────────────────────
+
+export async function parseDocxToText(file: File): Promise<string> {
+  const mammoth = await import("mammoth");
+  const buf = await file.arrayBuffer();
+  // extractRawText is faster than convertToHtml and good enough for LLM consumption.
+  const r = await (mammoth as any).extractRawText({ arrayBuffer: buf });
+  const messages = (r.messages ?? []).filter((m: any) => m.type !== "info");
+  const warningTail = messages.length > 0
+    ? `\n\n[parser notes: ${messages.slice(0, 3).map((m: any) => m.message).join("; ")}]`
+    : "";
+  return (r.value ?? "").trim() + warningTail;
+}
+
+export async function parseXlsxToText(file: File): Promise<string> {
+  const XLSX = await import("xlsx");
+  const buf = await file.arrayBuffer();
+  const wb = (XLSX as any).read(buf, { type: "array" });
+  const out: string[] = [];
+  for (const sheetName of wb.SheetNames) {
+    const sheet = wb.Sheets[sheetName];
+    const csv = (XLSX as any).utils.sheet_to_csv(sheet, { blankrows: false });
+    out.push(`--- Sheet: ${sheetName} ---\n${csv}`);
+  }
+  return out.join("\n\n");
+}
+
+export async function parsePptxToText(file: File): Promise<string> {
+  // .pptx is a zip; each slide is ppt/slides/slideN.xml. We extract <a:t> text.
+  const JSZip = (await import("jszip")).default;
+  const zip = await JSZip.loadAsync(await file.arrayBuffer());
+  const slideFiles = Object.keys(zip.files)
+    .filter((name) => /^ppt\/slides\/slide\d+\.xml$/i.test(name))
+    .sort((a, b) => {
+      const na = parseInt(a.match(/slide(\d+)/)?.[1] ?? "0", 10);
+      const nb = parseInt(b.match(/slide(\d+)/)?.[1] ?? "0", 10);
+      return na - nb;
+    });
+  const out: string[] = [];
+  for (const name of slideFiles) {
+    const xml = await zip.files[name].async("string");
+    // Pull every <a:t>…</a:t> run.
+    const matches = xml.match(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g) ?? [];
+    const text = matches
+      .map((m) => m.replace(/<a:t[^>]*>|<\/a:t>/g, ""))
+      .map(decodeXmlEntities)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
+    const slideNum = name.match(/slide(\d+)/)?.[1] ?? "?";
+    out.push(`--- Slide ${slideNum} ---\n${text}`);
+  }
+  // Speaker notes (optional, ppt/notesSlides/notesSlideN.xml).
+  const noteFiles = Object.keys(zip.files)
+    .filter((n) => /^ppt\/notesSlides\/notesSlide\d+\.xml$/i.test(n))
+    .sort();
+  if (noteFiles.length > 0) {
+    out.push("\n=== Speaker Notes ===");
+    for (const name of noteFiles) {
+      const xml = await zip.files[name].async("string");
+      const matches = xml.match(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g) ?? [];
+      const text = matches
+        .map((m) => m.replace(/<a:t[^>]*>|<\/a:t>/g, ""))
+        .map(decodeXmlEntities)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      const num = name.match(/notesSlide(\d+)/)?.[1] ?? "?";
+      if (text) out.push(`[Notes ${num}] ${text}`);
+    }
+  }
+  return out.join("\n\n");
+}
+
+function decodeXmlEntities(s: string): string {
+  return s
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(parseInt(d, 10)));
 }

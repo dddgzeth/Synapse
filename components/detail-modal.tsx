@@ -11,6 +11,7 @@
 
 import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import { useI18n } from "./i18n";
 
 type DetailRequest =
   | { kind: "scene"; filename: string }
@@ -46,13 +47,8 @@ interface ConversationItem {
   recorded_at: string;
 }
 
-const TYPE_LABEL: Record<string, string> = {
-  claim: "观点", method: "方法", observation: "观察",
-  dataset: "数据集", experiment: "实验", finding: "发现",
-  question: "问题", goal: "目标",
-};
-
 export function DetailModal() {
+  const { t, locale } = useI18n();
   const [open, setOpen] = useState<DetailRequest | null>(null);
   const [scene, setScene] = useState<ScenePayload | null>(null);
   const [memory, setMemory] = useState<{ memory: MemoryRecord; conversations: ConversationItem[] } | null>(null);
@@ -152,11 +148,11 @@ export function DetailModal() {
             color: "var(--accent)",
             textTransform: "uppercase", letterSpacing: 1.2,
           }}>
-            {open.kind === "scene" ? "L2 · 主题场景" : "L1 · 单条记忆"}
+            {open.kind === "scene" ? t.details.sceneEyebrow : t.details.memoryEyebrow}
           </span>
           <button
             onClick={() => setOpen(null)}
-            aria-label="关闭"
+            aria-label={t.common.close}
             style={{
               background: "transparent", border: "none",
               fontSize: 18, color: "var(--text-muted)",
@@ -166,10 +162,10 @@ export function DetailModal() {
         </header>
 
         <div style={{ padding: "20px 28px 28px" }}>
-          {loading && <p style={mutedP}>加载中…</p>}
-          {error && <p style={{ color: "#a01010", fontSize: 13 }}>加载失败：{error}</p>}
-          {scene && <SceneView scene={scene} />}
-          {memory && <MemoryView memory={memory.memory} conversations={memory.conversations} />}
+          {loading && <p style={mutedP}>{t.common.loading}</p>}
+          {error && <p style={{ color: "#a01010", fontSize: 13 }}>{t.common.loadFailed}: {error}</p>}
+          {scene && <SceneView scene={scene} locale={locale} />}
+          {memory && <MemoryView memory={memory.memory} conversations={memory.conversations} locale={locale} />}
         </div>
       </article>
 
@@ -183,15 +179,16 @@ export function DetailModal() {
   );
 }
 
-function SceneView({ scene }: { scene: ScenePayload }) {
+function SceneView({ scene, locale }: { scene: ScenePayload; locale: string }) {
+  const { t } = useI18n();
   return (
     <>
       <h2 style={h2}>{scene.title}</h2>
       {scene.summary && <p style={subtitle}>{scene.summary}</p>}
       <div style={metaRow}>
-        <span style={pill}>🔥 热度 {scene.heat}</span>
+        <span style={pill}>🔥 {t.common.heat} {scene.heat}</span>
         {scene.updated && (
-          <span style={pill}>更新于 {new Date(scene.updated).toLocaleString("zh-CN")}</span>
+          <span style={pill}>{t.common.updatedAt} {new Date(scene.updated).toLocaleString(locale)}</span>
         )}
         <span style={{ ...pill, opacity: 0.7 }}>{scene.filename}</span>
       </div>
@@ -202,30 +199,32 @@ function SceneView({ scene }: { scene: ScenePayload }) {
   );
 }
 
-function MemoryView({ memory, conversations }: { memory: MemoryRecord; conversations: ConversationItem[] }) {
+function MemoryView({ memory, conversations, locale }: { memory: MemoryRecord; conversations: ConversationItem[]; locale: string }) {
+  const { t } = useI18n();
+  const typeLabel = (t.typeLabels as Record<string, string>)[memory.type] ?? memory.type;
   return (
     <>
       <h2 style={h2}>
-        {TYPE_LABEL[memory.type] ?? memory.type}
+        {typeLabel}
         <span style={{ fontSize: 14, color: "var(--text-muted)", fontWeight: 400, marginLeft: 10 }}>
           P{memory.priority}
         </span>
       </h2>
       {memory.scene_name && <p style={subtitle}>{memory.scene_name}</p>}
       <div style={metaRow}>
-        <span style={pill}>创建 {new Date(memory.createdAt).toLocaleString("zh-CN")}</span>
-        <span style={pill}>更新 {new Date(memory.updatedAt).toLocaleString("zh-CN")}</span>
+        <span style={pill}>{t.common.created} {new Date(memory.createdAt).toLocaleString(locale)}</span>
+        <span style={pill}>{t.common.updated} {new Date(memory.updatedAt).toLocaleString(locale)}</span>
         <span style={{ ...pill, opacity: 0.7 }}>{memory.id}</span>
       </div>
 
-      <div style={sectionLabel}>L1 内容</div>
+      <div style={sectionLabel}>{t.details.l1Content}</div>
       <div style={{ whiteSpace: "pre-wrap", fontSize: 14.5, lineHeight: 1.75, marginBottom: 18 }}>
         {memory.content}
       </div>
 
-      <div style={sectionLabel}>原始对话 (L0 · {conversations.length} 条)</div>
+      <div style={sectionLabel}>{t.details.l0Conversation(conversations.length)}</div>
       {conversations.length === 0 ? (
-        <p style={mutedP}>（这条记忆没有可关联的 L0 原始消息）</p>
+        <p style={mutedP}>{t.details.noL0}</p>
       ) : (
         conversations.map((c) => (
           <div key={c.record_id} style={l0Bubble(c.role === "user")}>
@@ -234,7 +233,7 @@ function MemoryView({ memory, conversations }: { memory: MemoryRecord; conversat
                 {c.role === "user" ? "User" : "Synapse"}
               </span>
               <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
-                {new Date(c.recorded_at).toLocaleString("zh-CN")}
+                {new Date(c.recorded_at).toLocaleString(locale)}
               </span>
             </div>
             <div style={{ whiteSpace: "pre-wrap", fontSize: 13.5, lineHeight: 1.7 }}>

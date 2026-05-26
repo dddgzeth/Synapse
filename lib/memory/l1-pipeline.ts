@@ -33,7 +33,6 @@ import {
   setPipelineState,
   queryAllL1,
 } from "./store";
-import { runL2L3Pipeline } from "./l2-l3-pipeline";
 
 const TAG = "[synapse][l1-pipeline]";
 const TRIGGER_EVERY_N = 5; // L1 trigger: every 5 conversation turns
@@ -62,10 +61,14 @@ export function shouldTriggerL1(sessionKey: string): boolean {
 // Main L1 pipeline
 // ============================
 
-export async function runL1Pipeline(sessionKey: string, sessionId: string): Promise<void> {
+export interface L1RunResult {
+  newMemoryRecords: MemoryRecord[];
+}
+
+export async function runL1Pipeline(sessionKey: string, sessionId: string): Promise<L1RunResult> {
   const runner = getLLMRunner();
   const l0Messages = queryL0ForSession(sessionKey, 50);
-  if (l0Messages.length === 0) return;
+  if (l0Messages.length === 0) return { newMemoryRecords: [] };
 
   // Split background vs new messages
   const bgMessages: ConversationMessage[] = l0Messages
@@ -87,7 +90,7 @@ export async function runL1Pipeline(sessionKey: string, sessionId: string): Prom
       timestamp: m.timestamp,
     }));
 
-  if (newMessages.length === 0) return;
+  if (newMessages.length === 0) return { newMemoryRecords: [] };
 
   const previousSceneName = getPipelineState(`last_scene:${sessionKey}`) ?? undefined;
 
@@ -101,11 +104,11 @@ export async function runL1Pipeline(sessionKey: string, sessionId: string): Prom
     });
   } catch (err) {
     console.error(`${TAG} L1 extraction LLM failed:`, err);
-    return;
+    return { newMemoryRecords: [] };
   }
 
   const extracted = parseExtractionResponse(rawText);
-  if (extracted.length === 0) return;
+  if (extracted.length === 0) return { newMemoryRecords: [] };
 
   // Update last scene name
   const lastScene = extracted[extracted.length - 1].scene_name;
@@ -116,7 +119,7 @@ export async function runL1Pipeline(sessionKey: string, sessionId: string): Prom
     record_id: generateMemoryId(),
   }));
 
-  if (allExtracted.length === 0) return;
+  if (allExtracted.length === 0) return { newMemoryRecords: [] };
 
   // Step 2: Dedup — find candidates for each new memory
   const existingTexts = queryAllL1(200).map((r) => r.content).join(" ");
@@ -191,17 +194,9 @@ export async function runL1Pipeline(sessionKey: string, sessionId: string): Prom
 
   console.log(`${TAG} L1 pipeline done: ${writtenRecords.length} memories written`);
 
-  // Step 4: trigger L2 (scene extraction) + L3 (persona) in background.
-  // Don't await — L1 result is already committed; L2/L3 failures shouldn't block.
-  if (writtenRecords.length > 0) {
-    runL2L3Pipeline({
-      newMemories: writtenRecords.map((r) => ({
-        id: r.id,
-        content: r.content,
-        createdAt: r.createdAt,
-      })),
-    }).catch((err) => console.error(`${TAG} L2/L3 pipeline failed:`, err));
-  }
+  // L2/L3 triggering is now owned by the scheduler (lib/memory/scheduler.ts).
+  // L1 just returns what it wrote.
+  return { newMemoryRecords: writtenRecords };
 }
 
 // ============================

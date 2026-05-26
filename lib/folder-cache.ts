@@ -1,13 +1,13 @@
 /**
  * Folder handle cache via IndexedDB.
  *
+ * Keys are namespaced by userId ("userId:folderName") so each user sees
+ * only their own connected folders — essential for multi-user isolation.
+ *
  * FileSystemDirectoryHandle survives structured-clone, so we can persist it
  * across page reloads. On restore we still need to re-check the permission
  * (browsers downgrade the grant after the tab closes) and possibly ask the
  * user to re-authorize via a click.
- *
- * Keyed by folder display name (handle.name). If the user re-picks the same
- * folder we just overwrite.
  *
  * Browser-only — caller must guard against SSR.
  */
@@ -30,26 +30,32 @@ function openDb(): Promise<IDBDatabase> {
   });
 }
 
+function userKey(userId: string, name: string) {
+  return `${userId}:${name}`;
+}
+
 export interface CachedFolder {
   name: string;
   handle: FileSystemDirectoryHandle;
 }
 
 export async function saveFolderHandle(
+  userId: string,
   name: string,
   handle: FileSystemDirectoryHandle,
 ): Promise<void> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");
-    tx.objectStore(STORE).put(handle, name);
+    tx.objectStore(STORE).put(handle, userKey(userId, name));
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });
 }
 
-export async function loadFolderHandles(): Promise<CachedFolder[]> {
+export async function loadFolderHandles(userId: string): Promise<CachedFolder[]> {
   const db = await openDb();
+  const prefix = `${userId}:`;
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE, "readonly");
     const store = tx.objectStore(STORE);
@@ -62,7 +68,9 @@ export async function loadFolderHandles(): Promise<CachedFolder[]> {
     tx.oncomplete = () => {
       const out: CachedFolder[] = [];
       for (let i = 0; i < keys.length; i++) {
-        if (keys[i] && vals[i]) out.push({ name: keys[i], handle: vals[i] });
+        if (keys[i]?.startsWith(prefix) && vals[i]) {
+          out.push({ name: keys[i].slice(prefix.length), handle: vals[i] });
+        }
       }
       resolve(out);
     };
@@ -70,11 +78,11 @@ export async function loadFolderHandles(): Promise<CachedFolder[]> {
   });
 }
 
-export async function removeFolderHandle(name: string): Promise<void> {
+export async function removeFolderHandle(userId: string, name: string): Promise<void> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
     const tx = db.transaction(STORE, "readwrite");
-    tx.objectStore(STORE).delete(name);
+    tx.objectStore(STORE).delete(userKey(userId, name));
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });

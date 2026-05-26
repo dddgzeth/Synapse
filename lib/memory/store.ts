@@ -9,6 +9,7 @@
 
 import path from "node:path";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import Database from "better-sqlite3";
 import type { MemoryRecord } from "../tencentdb/record/l1-writer";
 
@@ -28,6 +29,19 @@ export function getDb(): Database.Database {
 
   // ── L0: raw conversations ──
   db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      user_id TEXT PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL DEFAULT '',
+      image TEXT NOT NULL DEFAULT '',
+      password_hash TEXT,
+      auth_provider TEXT NOT NULL DEFAULT 'credentials',
+      provider_account_id TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_users_provider ON users(auth_provider, provider_account_id);
+
     CREATE TABLE IF NOT EXISTS l0_conversations (
       record_id TEXT PRIMARY KEY,
       session_key TEXT NOT NULL,
@@ -107,8 +121,19 @@ export function getDb(): Database.Database {
     );
   `);
 
+  // ── Aha history (every detected Aha is appended; nothing is overwritten) ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS aha_history (
+      id TEXT PRIMARY KEY,
+      detected_at TEXT NOT NULL,
+      payload_json TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_aha_history_detected ON aha_history(detected_at DESC);
+  `);
+
   // ── Migration: rebuild FTS with trigram tokenizer if needed ──
   migrateFtsTrigram(db);
+  seedTestUser(db);
 
   _db = db;
   return _db;
@@ -137,6 +162,124 @@ function migrateFtsTrigram(db: Database.Database) {
   rebuild("l0_fts", "l0_conversations", "message_text");
   rebuild("l1_fts", "l1_records", "content");
   db.exec(`PRAGMA user_version = ${FTS_VERSION}`);
+}
+
+export interface UserRecord {
+  user_id: string;
+  email: string;
+  name: string;
+  image: string;
+  password_hash: string | null;
+  auth_provider: string;
+  provider_account_id: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `scrypt:${salt}:${hash}`;
+}
+
+export function verifyPassword(password: string, stored: string | null | undefined): boolean {
+  if (!stored) return false;
+  const [scheme, salt, hash] = stored.split(":");
+  if (scheme !== "scrypt" || !salt || !hash) return false;
+  const actual = crypto.scryptSync(password, salt, 64);
+  const expected = Buffer.from(hash, "hex");
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+function seedTestUser(db: Database.Database) {
+  const email = process.env.AUTH_TEST_EMAIL?.trim().toLowerCase();
+  const password = process.env.AUTH_TEST_PASSWORD ?? "";
+  if (!email || !password) return;
+
+  const existing = db.prepare("SELECT user_id FROM users WHERE email = ?").get(email);
+  if (existing) return;
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO users
+      (user_id, email, name, image, password_hash, auth_provider, provider_account_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    `user_test_${crypto.createHash("sha256").update(email).digest("hex").slice(0, 12)}`,
+    email,
+    "Test User",
+    "",
+    hashPassword(password),
+    "credentials",
+    "",
+    now,
+    now,
+  );
+}
+
+export function createEmailUser(email: string, password: string): UserRecord {
+  const db = getDb();
+  const normalized = email.trim().toLowerCase();
+  const now = new Date().toISOString();
+  const userId = `user_${crypto.randomBytes(8).toString("hex")}`;
+  db.prepare(`
+    INSERT INTO users
+      (user_id, email, name, image, password_hash, auth_provider, provider_account_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(userId, normalized, normalized, "", hashPassword(password), "credentials", "", now, now);
+  return db.prepare("SELECT * FROM users WHERE user_id = ?").get(userId) as UserRecord;
+}
+
+export function getUserByEmail(email: string): UserRecord | null {
+  const db = getDb();
+  const normalized = email.trim().toLowerCase();
+  return db.prepare("SELECT * FROM users WHERE email = ?").get(normalized) as UserRecord | undefined ?? null;
+}
+
+export function getUserById(userId: string): UserRecord | null {
+  const db = getDb();
+  return db.prepare("SELECT * FROM users WHERE user_id = ?").get(userId) as UserRecord | undefined ?? null;
+}
+
+export function findOrCreateOAuthUser(params: {
+  provider: string;
+  providerAccountId: string;
+  email: string;
+  name?: string | null;
+  image?: string | null;
+}): UserRecord {
+  const db = getDb();
+  const email = params.email.trim().toLowerCase();
+  const now = new Date().toISOString();
+  const existing = getUserByEmail(email);
+  if (existing) {
+    db.prepare(`
+      UPDATE users
+      SET name = COALESCE(NULLIF(?, ''), name),
+          image = COALESCE(NULLIF(?, ''), image),
+          auth_provider = ?,
+          provider_account_id = ?,
+          updated_at = ?
+      WHERE user_id = ?
+    `).run(params.name ?? "", params.image ?? "", params.provider, params.providerAccountId, now, existing.user_id);
+    return getUserById(existing.user_id) ?? existing;
+  }
+
+  const userId = `user_${crypto.randomUUID()}`;
+  db.prepare(`
+    INSERT INTO users
+      (user_id, email, name, image, password_hash, auth_provider, provider_account_id, created_at, updated_at)
+    VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?)
+  `).run(
+    userId,
+    email,
+    params.name ?? "",
+    params.image ?? "",
+    params.provider,
+    params.providerAccountId,
+    now,
+    now,
+  );
+  return getUserById(userId)!;
 }
 
 // ============================
@@ -169,6 +312,19 @@ export function queryL0ForSession(sessionKey: string, limit = 100): L0Message[] 
     WHERE session_key = ?
     ORDER BY timestamp ASC
     LIMIT ?
+  `).all(sessionKey, limit) as L0Message[];
+}
+
+export function queryL0HistoryForSession(sessionKey: string, limit = 100): L0Message[] {
+  const db = getDb();
+  return db.prepare(`
+    SELECT * FROM (
+      SELECT * FROM l0_conversations
+      WHERE session_key = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    )
+    ORDER BY timestamp ASC
   `).all(sessionKey, limit) as L0Message[];
 }
 
@@ -293,6 +449,35 @@ export function getPipelineState(key: string): string | null {
 
 export function setPipelineState(key: string, value: string): void {
   getDb().prepare("INSERT OR REPLACE INTO pipeline_state (key, value) VALUES (?, ?)").run(key, value);
+}
+
+// ============================
+// Aha History
+// ============================
+
+export interface AhaHistoryRow {
+  id: string;
+  detected_at: string;
+  payload_json: string;
+}
+
+export function appendAhaHistory(id: string, detectedAt: string, payloadJson: string): void {
+  getDb()
+    .prepare("INSERT OR REPLACE INTO aha_history (id, detected_at, payload_json) VALUES (?, ?, ?)")
+    .run(id, detectedAt, payloadJson);
+}
+
+export function listAhaHistory(limit = 30): AhaHistoryRow[] {
+  return getDb()
+    .prepare("SELECT id, detected_at, payload_json FROM aha_history ORDER BY detected_at DESC LIMIT ?")
+    .all(limit) as AhaHistoryRow[];
+}
+
+export function getAhaById(id: string): AhaHistoryRow | null {
+  const row = getDb()
+    .prepare("SELECT id, detected_at, payload_json FROM aha_history WHERE id = ?")
+    .get(id) as AhaHistoryRow | undefined;
+  return row ?? null;
 }
 
 // ============================

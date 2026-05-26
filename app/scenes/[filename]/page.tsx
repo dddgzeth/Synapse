@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import ReactMarkdown from "react-markdown";
+import { useI18n } from "@/components/i18n";
 
 interface ScenePayload {
   filename: string;
@@ -19,6 +20,7 @@ interface ScenePayload {
 }
 
 export default function SceneDetailPage() {
+  const { t, locale } = useI18n();
   const params = useParams<{ filename: string }>();
   const filename = decodeURIComponent(params.filename);
   const [scene, setScene] = useState<ScenePayload | null>(null);
@@ -38,19 +40,19 @@ export default function SceneDetailPage() {
 
   return (
     <main style={pageWrap}>
-      <Link href="/" style={backLink}>← 返回对话</Link>
+      <Link href="/" style={backLink}>{t.common.backToChat}</Link>
 
       <header style={{ marginBottom: 18 }}>
-        <div style={eyebrow}>L2 · 主题场景</div>
+        <div style={eyebrow}>{t.details.sceneEyebrow}</div>
         <h1 style={h1}>{scene?.title ?? filename.replace(/\.md$/, "")}</h1>
         {scene?.summary && (
           <p style={subtitle}>{scene.summary}</p>
         )}
         {scene && (
           <div style={metaRow}>
-            <span style={pill}>🔥 热度 {scene.heat}</span>
+            <span style={pill}>🔥 {t.common.heat} {scene.heat}</span>
             {scene.updated && (
-              <span style={pill}>更新于 {new Date(scene.updated).toLocaleString("zh-CN")}</span>
+              <span style={pill}>{t.common.updatedAt} {new Date(scene.updated).toLocaleString(locale)}</span>
             )}
             <span style={{ ...pill, opacity: 0.7 }}>{scene.filename}</span>
           </div>
@@ -58,8 +60,8 @@ export default function SceneDetailPage() {
       </header>
 
       <article style={card} className="prose">
-        {loading && <p style={{ color: "var(--text-muted)" }}>加载中…</p>}
-        {error && <p style={{ color: "#a01010" }}>加载失败：{error}</p>}
+        {loading && <p style={{ color: "var(--text-muted)" }}>{t.common.loading}</p>}
+        {error && <p style={{ color: "#a01010" }}>{t.common.loadFailed}: {error}</p>}
         {scene && <ReactMarkdown>{scene.content}</ReactMarkdown>}
       </article>
     </main>

@@ -6,8 +6,10 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
+import { useI18n } from "@/components/i18n";
 
 export default function PersonaPage() {
+  const { t } = useI18n();
   const [text, setText] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
@@ -21,17 +23,17 @@ export default function PersonaPage() {
 
   return (
     <main style={pageWrap}>
-      <Link href="/" style={backLink}>← 返回对话</Link>
+      <Link href="/" style={backLink}>{t.common.backToChat}</Link>
       <header style={{ marginBottom: 18 }}>
-        <div style={eyebrow}>L3 · 长期画像</div>
-        <h1 style={h1}>个人画像</h1>
+        <div style={eyebrow}>{t.details.personaEyebrow}</div>
+        <h1 style={h1}>{t.details.personaTitle}</h1>
       </header>
 
       <article style={card} className="prose">
-        {loading && <p style={{ color: "var(--text-muted)" }}>加载中…</p>}
+        {loading && <p style={{ color: "var(--text-muted)" }}>{t.common.loading}</p>}
         {!loading && !text && (
           <p style={{ color: "var(--text-muted)" }}>
-            画像尚未生成。继续对话后，Synapse 会在积累足够记忆后自动生成你的研究者画像。
+            {t.details.personaEmpty}
           </p>
         )}
         {!loading && text && <ReactMarkdown>{text}</ReactMarkdown>}

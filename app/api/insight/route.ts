@@ -14,6 +14,7 @@ import { searchSemanticScholar, searchArxiv } from "@/lib/search/external";
 import { recallForQuery } from "@/lib/memory/recall";
 import { insertL0 } from "@/lib/memory/store";
 import { runL1Pipeline } from "@/lib/memory/l1-pipeline";
+import { getCurrentSessionKey } from "@/lib/auth-session";
 
 export const runtime = "nodejs";
 export const maxDuration = 180;
@@ -55,17 +56,20 @@ async function callMiromind(
   messages: any[],
   tools: typeof TOOLS | undefined,
   signal: AbortSignal,
+  apiSettings?: { apiKey?: string; baseUrl?: string; model?: string },
 ): Promise<any> {
-  const base = process.env.MIROMIND_BASE_URL ?? "https://api.miromind.ai/v1";
+  const base = apiSettings?.baseUrl?.trim() || process.env.MIROMIND_BASE_URL || "https://api.miromind.ai/v1";
+  const apiKey = apiSettings?.apiKey?.trim() || process.env.MIROMIND_API_KEY || "";
+  const model = apiSettings?.model?.trim() || process.env.MIROMIND_MODEL || "mirothinker-1-7-deepresearch-mini";
   const res = await fetch(`${base}/chat/completions`, {
     method: "POST",
     signal,
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.MIROMIND_API_KEY ?? ""}`,
+      Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify({
-      model: process.env.MIROMIND_MODEL ?? "mirothinker-1-7-deepresearch-mini",
+      model,
       messages,
       max_tokens: 4096,
       stream: false,
@@ -80,8 +84,17 @@ async function callMiromind(
 }
 
 export async function POST(req: NextRequest) {
-  const body = await req.json() as { query: string; sessionKey?: string; sessionId?: string };
-  const { query, sessionKey = "deep_research", sessionId = crypto.randomUUID() } = body;
+  const body = await req.json() as {
+    query: string;
+    sessionKey?: string;
+    sessionId?: string;
+    apiSettings?: { apiKey?: string; baseUrl?: string; model?: string };
+  };
+  const { query, sessionKey: requestedSessionKey = "deep_research", sessionId = crypto.randomUUID(), apiSettings } = body;
+  const sessionKey = await getCurrentSessionKey(requestedSessionKey);
+  if (!sessionKey) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
 
   if (!query?.trim()) {
     return NextResponse.json({ error: "No query" }, { status: 400 });
@@ -105,7 +118,7 @@ ${recall.contextText ? `用户研究背景：\n${recall.contextText}\n\n` : ""}�
   try {
     let finalText = "";
     for (let step = 0; step < 5; step++) {
-      const response = await callMiromind(messages, TOOLS, controller.signal);
+      const response = await callMiromind(messages, TOOLS, controller.signal, apiSettings);
       const choice = response.choices?.[0];
       const msg = choice?.message;
       if (!msg) throw new Error(`miromind returned no message: ${JSON.stringify(response).slice(0, 200)}`);

@@ -1,12 +1,13 @@
 "use client";
 
 import { useChat } from "@ai-sdk/react";
-import { DefaultChatTransport } from "ai";
+import { DefaultChatTransport, lastAssistantMessageIsCompleteWithToolCalls } from "ai";
 import type { FileUIPart, UIMessage } from "ai";
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { MessageBubble } from "./message-bubble";
 import { getSyncedFilesIndex, getSyncedFolderTrees } from "@/lib/synced-files-bus";
 import { readSyncedFileContent } from "@/lib/synced-files";
+import { getApiSettingsForRequest, useI18n, type ApiSettings } from "./i18n";
 
 interface Props {
   sessionKey: string;
@@ -23,6 +24,7 @@ interface AttachedFile {
 }
 
 export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
+  const { t, apiSettings } = useI18n();
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState<AttachedFile[]>([]);
   const [showDeepResearch, setShowDeepResearch] = useState(false);
@@ -30,6 +32,7 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const isComposingRef = useRef(false);
 
   const transport = useMemo(
     () => new DefaultChatTransport({
@@ -41,17 +44,22 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
           ...body,
           sessionKey,
           syncedFilesIndex: getSyncedFilesIndex(),
+          apiSettings: getApiSettingsForRequest(apiSettings),
           messages,
           id,
         },
       }),
     }),
-    [sessionKey],
+    [apiSettings, sessionKey],
   );
 
   const { messages, sendMessage, stop, status, setMessages, addToolResult } = useChat({
     transport,
     onFinish: () => { setTimeout(onMemoryUpdate, 1500); },
+    // After a client-side tool result is appended, automatically POST a follow-up
+    // turn so the server resumes the loop with the tool output. Without this the
+    // assistant message stays empty after the first tool call.
+    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithToolCalls,
     // Client-side tool execute. Server defines `read_synced_file` without an
     // `execute`, so AI SDK forwards the tool call here. We read the file from
     // the browser handle (text directly, PDF via pdfjs-dist), return text via
@@ -83,6 +91,23 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
 
   const isStreaming = status === "streaming" || status === "submitted";
   const isLoading = isStreaming || deepLoading;
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadHistory() {
+      try {
+        const resp = await fetch(`/api/chat/history?sessionKey=${encodeURIComponent(sessionKey)}&limit=100`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (cancelled || !Array.isArray(data.messages) || data.messages.length === 0) return;
+        setMessages((current) => current.length === 0 ? data.messages as UIMessage[] : current);
+      } catch (err) {
+        console.error("[chat-panel] failed to load chat history:", err);
+      }
+    }
+    loadHistory();
+    return () => { cancelled = true; };
+  }, [sessionKey, setMessages]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -144,9 +169,9 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
     let finalText = text;
     if (textAttachments.length > 0) {
       const blocks = textAttachments
-        .map((a) => `<<<文件: ${a.name}>>>\n${a.textContent}\n<<<结束: ${a.name}>>>`)
+        .map((a) => `<<<file: ${a.name}>>>\n${a.textContent}\n<<<end: ${a.name}>>>`)
         .join("\n\n");
-      finalText = blocks + (text ? `\n\n${text}` : "\n\n请基于以上文件回答。");
+      finalText = blocks + (text ? `\n\n${text}` : `\n\n${t.chat.filePrompt}`);
     }
 
     sendMessage({ text: finalText || " ", ...(files.length > 0 ? { files } : {}) });
@@ -168,10 +193,44 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
 
   async function handleFileSelect(e: React.ChangeEvent<HTMLInputElement>) {
     for (const file of Array.from(e.target.files ?? [])) {
-      const url = await readAsDataUrl(file);
+      const isImage = file.type.startsWith("image/");
+      if (isImage) {
+        const url = await readAsDataUrl(file);
+        setAttachments((prev) => [
+          ...prev,
+          { id: crypto.randomUUID(), name: file.name, mediaType: file.type, url, isImage: true },
+        ]);
+        continue;
+      }
+      // Try text-like first, then office-doc parsers.
+      let textContent = "";
+      const lower = file.name.toLowerCase();
+      try {
+        if (/\.(txt|md|tex|rst|csv|json|ya?ml)$/i.test(lower)) {
+          textContent = await file.text();
+        } else {
+          const { classifyKind, parsePdfToText, parseDocxToText, parsePptxToText, parseXlsxToText } =
+            await import("@/lib/synced-files");
+          const kind = classifyKind(file.name);
+          if (kind === "pdf") textContent = await parsePdfToText(file);
+          else if (kind === "docx") textContent = await parseDocxToText(file);
+          else if (kind === "pptx") textContent = await parsePptxToText(file);
+          else if (kind === "xlsx") textContent = await parseXlsxToText(file);
+        }
+      } catch (err) {
+        console.error("[chat-panel] parse failed:", err);
+        textContent = `[failed to parse ${file.name}: ${err instanceof Error ? err.message : String(err)}]`;
+      }
       setAttachments((prev) => [
         ...prev,
-        { id: crypto.randomUUID(), name: file.name, mediaType: file.type || "application/octet-stream", url, isImage: file.type.startsWith("image/") },
+        {
+          id: crypto.randomUUID(),
+          name: file.name,
+          mediaType: file.type || "application/octet-stream",
+          url: "",
+          isImage: false,
+          textContent,
+        },
       ]);
     }
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -184,7 +243,13 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
       {/* Messages */}
       <div className="scrollbar-thin" style={{ flex: 1, overflowY: "auto", padding: "24px 0" }}>
         {messages.length === 0 && <EmptyState />}
-        {messages.map((m) => <MessageBubble key={m.id} message={m} />)}
+        {messages.map((m, idx) => (
+          <MessageBubble
+            key={m.id}
+            message={m}
+            streaming={isStreaming && idx === messages.length - 1 && m.role === "assistant"}
+          />
+        ))}
         {isLoading && (
           <div style={{ padding: "8px 24px", display: "flex", alignItems: "center", gap: 8 }}>
             <div style={{ display: "flex", gap: 4 }}>
@@ -197,7 +262,7 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
               ))}
             </div>
             <span style={{ color: "var(--text-muted)", fontSize: 13 }}>
-              {deepLoading ? "正在联网搜索分析…" : "Synapse 正在思考…"}
+              {deepLoading ? t.chat.deepThinking : t.chat.thinking}
             </span>
           </div>
         )}
@@ -247,10 +312,19 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onPaste={handlePaste}
+            onCompositionStart={() => { isComposingRef.current = true; }}
+            onCompositionEnd={() => { isComposingRef.current = false; }}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSubmit(); }
+              const isComposing =
+                isComposingRef.current ||
+                e.nativeEvent.isComposing ||
+                e.nativeEvent.keyCode === 229;
+              if (e.key === "Enter" && !e.shiftKey && !isComposing) {
+                e.preventDefault();
+                handleSubmit();
+              }
             }}
-            placeholder="输入任何问题，或粘贴图片…"
+            placeholder={t.chat.placeholder}
             rows={1}
             style={{
               display: "block", width: "100%",
@@ -270,12 +344,12 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
           }}>
             {/* Left: attach */}
             <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <IconBtn title="附加文件或图片" onClick={() => fileInputRef.current?.click()}>
+              <IconBtn title={t.chat.attachTitle} onClick={() => fileInputRef.current?.click()}>
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
                 </svg>
               </IconBtn>
-              <input ref={fileInputRef} type="file" accept="image/*,.txt,.md,.pdf,.tex,.csv" multiple style={{ display: "none" }} onChange={handleFileSelect} />
+              <input ref={fileInputRef} type="file" accept="image/*,.txt,.md,.pdf,.tex,.csv,.docx,.pptx,.xlsx,.xls,.json,.yaml,.yml,.rst" multiple style={{ display: "none" }} onChange={handleFileSelect} />
             </div>
 
             {/* Right: Deep Research + stop/send */}
@@ -283,7 +357,7 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
               <button
                 onClick={() => setShowDeepResearch(true)}
                 disabled={isLoading}
-                title="用深度研究模型搜索 Semantic Scholar + arXiv 学术数据库"
+                title={t.chat.deepResearchTitle}
                 style={{
                   display: "flex", alignItems: "center", gap: 6,
                   padding: "5px 12px", borderRadius: 8, cursor: isLoading ? "not-allowed" : "pointer",
@@ -314,7 +388,7 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
                   onMouseLeave={(e) => (e.currentTarget.style.background = "var(--surface)")}
                 >
                   <span style={{ width: 9, height: 9, background: "var(--text)", borderRadius: 2, flexShrink: 0 }} />
-                  停止
+                  {t.chat.stop}
                 </button>
               ) : (
                 <button
@@ -329,7 +403,7 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
                     transition: "background 0.2s",
                   }}
                 >
-                  发送
+                  {t.chat.send}
                 </button>
               )}
             </div>
@@ -337,7 +411,7 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
         </div>
 
         <div style={{ textAlign: "center", marginTop: 6, fontSize: 11, color: "var(--text-muted)", opacity: 0.7 }}>
-          Enter 发送 · Shift+Enter 换行 · 可直接粘贴图片
+          {t.chat.hint}
         </div>
       </div>
 
@@ -345,6 +419,7 @@ export function ChatPanel({ sessionKey, onMemoryUpdate }: Props) {
       {showDeepResearch && (
         <DeepResearchPanel
           sessionKey={sessionKey}
+          apiSettings={apiSettings}
           onClose={() => setShowDeepResearch(false)}
           onResult={(result) => {
             setMessages((prev) => [
@@ -379,6 +454,7 @@ function IconBtn({ children, title, onClick }: { children: React.ReactNode; titl
 }
 
 function EmptyState() {
+  const { t } = useI18n();
   return (
     <div style={{
       display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
@@ -387,15 +463,15 @@ function EmptyState() {
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img src="/logo-vertical.png" alt="Synapse" style={{ height: 160, width: "auto", mixBlendMode: "multiply", marginBottom: 24 }} />
       <div style={{ fontSize: 14, color: "var(--text-muted)", lineHeight: 1.9, textAlign: "center", maxWidth: 460, marginBottom: 32 }}>
-        Synapse 记住你所有的对话，随时间积累工作上下文，
-        <br />在你没注意到的地方，悄悄发现规律与联系。
+        {t.chat.emptyCopy.split("\n").map((line, idx) => (
+          <span key={line}>
+            {idx > 0 && <br />}
+            {line}
+          </span>
+        ))}
       </div>
       <div style={{ display: "flex", gap: 12, flexWrap: "wrap", justifyContent: "center" }}>
-        {[
-          { icon: "💬", label: "直接对话", desc: "提问、讨论、整理想法" },
-          { icon: "📁", label: "上传文件", desc: "同步本地文档或笔记" },
-          { icon: "🌐", label: "联网分析", desc: "搜索外部文献，深度研读" },
-        ].map(({ icon, label, desc }) => (
+        {t.chat.cards.map(({ icon, label, desc }) => (
           <div key={label} style={{
             padding: "14px 18px", background: "var(--surface)", border: "1px solid var(--border)",
             borderRadius: 12, width: 148, textAlign: "center",
@@ -416,13 +492,16 @@ function EmptyState() {
 
 function DeepResearchPanel({
   sessionKey,
+  apiSettings,
   onClose,
   onResult,
 }: {
   sessionKey: string;
+  apiSettings: ApiSettings;
   onClose: () => void;
   onResult: (text: string) => void;
 }) {
+  const { t } = useI18n();
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -438,22 +517,22 @@ function DeepResearchPanel({
       const resp = await fetch("/api/insight", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: query.trim(), sessionKey }),
+        body: JSON.stringify({ query: query.trim(), sessionKey, apiSettings: getApiSettingsForRequest(apiSettings) }),
       });
       const data = await resp.json();
-      if (!resp.ok || data.error) { setError(data.error ?? "搜索失败"); return; }
+      if (!resp.ok || data.error) { setError(data.error ?? t.chat.searchFailed); return; }
       const sources = data.sources as Array<{ title: string; source: string; year?: number }> | undefined;
       let text = data.result as string;
       if (sources && sources.length > 0) {
         const list = sources.slice(0, 6)
           .map((s, i) => `${i + 1}. **${s.title}** (${s.source}${s.year ? `, ${s.year}` : ""})`)
           .join("\n");
-        text += `\n\n---\n\n**参考来源**\n${list}`;
+        text += `\n\n---\n\n**${t.chat.references}**\n${list}`;
       }
       onResult(text);
       onClose();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "网络错误");
+      setError(e instanceof Error ? e.message : t.chat.networkError);
     } finally {
       setLoading(false);
     }
@@ -486,8 +565,7 @@ function DeepResearchPanel({
               <span style={{ fontSize: 15, fontWeight: 700, color: "var(--text)" }}>Deep Research</span>
             </div>
             <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>
-              使用专属深度研究模型，自动检索 <strong>Semantic Scholar</strong> + <strong>arXiv</strong> 学术数据库，
-              结合你的记忆上下文综合分析。
+              {t.chat.deepDescription}
             </div>
           </div>
           <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "var(--text-muted)", fontSize: 20, lineHeight: 1, padding: 0, marginLeft: 12 }}>×</button>
@@ -500,7 +578,7 @@ function DeepResearchPanel({
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={(e) => { if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) run(); }}
-            placeholder="输入你想深度分析的问题…"
+            placeholder={t.chat.deepPlaceholder}
             rows={3}
             style={{
               width: "100%", padding: "10px 12px",
@@ -512,9 +590,9 @@ function DeepResearchPanel({
           />
           {error && <div style={{ color: "#EF4444", fontSize: 12, marginTop: 6 }}>{error}</div>}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 12 }}>
-            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>⌘↵ 搜索</span>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{t.chat.shortcutSearch}</span>
             <div style={{ display: "flex", gap: 8 }}>
-              <button onClick={onClose} style={{ padding: "7px 16px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface-2)", color: "var(--text-muted)", fontSize: 13, cursor: "pointer" }}>取消</button>
+              <button onClick={onClose} style={{ padding: "7px 16px", borderRadius: 8, border: "1px solid var(--border)", background: "var(--surface-2)", color: "var(--text-muted)", fontSize: 13, cursor: "pointer" }}>{t.common.cancel}</button>
               <button
                 onClick={run}
                 disabled={loading || !query.trim()}
@@ -526,7 +604,7 @@ function DeepResearchPanel({
                   cursor: loading || !query.trim() ? "not-allowed" : "pointer",
                 }}
               >
-                {loading ? "搜索分析中…" : "开始搜索"}
+                {loading ? t.chat.searching : t.chat.startSearch}
               </button>
             </div>
           </div>

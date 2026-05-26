@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
+import { signOut, useSession } from "next-auth/react";
 import {
   loadFolderHandles,
   saveFolderHandle,
@@ -12,6 +13,7 @@ import {
 import { collectSyncedFilesIndex } from "@/lib/synced-files";
 import { setSyncedFiles } from "@/lib/synced-files-bus";
 import type { FolderTreeNode } from "@/lib/synced-files-types";
+import { useI18n, type ApiSettings } from "./i18n";
 
 interface SceneBlock {
   filename: string;
@@ -39,6 +41,13 @@ interface MemoriesData {
   recentMemories: RecentMemory[];
 }
 
+interface AhaHistoryItem {
+  id: string;
+  detectedAt: string;
+  pattern: string;
+  observation: string;
+}
+
 interface TreeNode {
   name: string;
   path: string;
@@ -47,6 +56,7 @@ interface TreeNode {
   children?: TreeNode[];
   isText?: boolean;
   isImage?: boolean;
+  isOffice?: boolean;
   uploaded?: boolean;
 }
 
@@ -62,30 +72,36 @@ interface SyncedFolder {
 
 const TEXT_EXTS = [".txt", ".md", ".tex", ".rst", ".csv", ".json", ".yaml", ".yml"];
 const IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".gif", ".webp"];
+// Office docs the LLM can read autonomously via read_synced_file (browser-parsed).
+const OFFICE_EXTS = [".pdf", ".docx", ".pptx", ".xlsx", ".xls"];
 
-function classifyFile(name: string): { isText: boolean; isImage: boolean } {
+function classifyFile(name: string): { isText: boolean; isImage: boolean; isOffice: boolean } {
   const lower = name.toLowerCase();
   return {
     isText: TEXT_EXTS.some((e) => lower.endsWith(e)),
     isImage: IMAGE_EXTS.some((e) => lower.endsWith(e)),
+    isOffice: OFFICE_EXTS.some((e) => lower.endsWith(e)),
   };
 }
 
-const TYPE_CONFIG: Record<string, { color: string; label: string }> = {
-  claim:       { color: "#7C6EF7", label: "观点" },
-  method:      { color: "#3B82F6", label: "方法" },
-  observation: { color: "#F59E0B", label: "观察" },
-  dataset:     { color: "#10B981", label: "资源" },
-  experiment:  { color: "#EF4444", label: "任务" },
-  finding:     { color: "#8B5CF6", label: "发现" },
-  question:    { color: "#06B6D4", label: "问题" },
-  goal:        { color: "#6B7280", label: "目标" },
+const TYPE_COLORS: Record<string, string> = {
+  claim: "#7C6EF7",
+  method: "#3B82F6",
+  observation: "#F59E0B",
+  dataset: "#10B981",
+  experiment: "#EF4444",
+  finding: "#8B5CF6",
+  question: "#06B6D4",
+  goal: "#6B7280",
 };
 
 // Custom event ChatPanel dispatches when L0/L1 may have changed → sidebar refetches.
 const REFRESH_EVENT = "synapse:memory-update";
 
 export function Sidebar() {
+  const { t, locale } = useI18n();
+  const { data: session, status: sessionStatus } = useSession();
+  const userId = session?.user?.id ?? null;
   const [data, setData] = useState<MemoriesData | null>(null);
   const [folders, setFolders] = useState<SyncedFolder[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -96,6 +112,9 @@ export function Sidebar() {
   // Per-folder ephemeral scan progress: { [folderName]: discoveredFileCount }.
   // Lives in component state because it's transient and not part of SyncedFolder.
   const [scanProgress, setScanProgress] = useState<Record<string, number>>({});
+  // Aha notification state — polled from /api/aha/last on memory refresh.
+  const [ahaUnseen, setAhaUnseen] = useState(false);
+  const [ahaHistory, setAhaHistory] = useState<AhaHistoryItem[]>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const searchTimeout = useRef<ReturnType<typeof setTimeout>>();
 
@@ -104,7 +123,28 @@ export function Sidebar() {
       .then((r) => r.json())
       .then(setData)
       .catch(console.error);
+    // Poll Aha state — cheap GET, cached on server.
+    fetch("/api/aha/last")
+      .then((r) => r.json())
+      .then((d) => setAhaUnseen(!!d.unseen))
+      .catch(() => {});
+    fetch("/api/aha/history")
+      .then((r) => r.json())
+      .then((d) => setAhaHistory(d.items ?? []))
+      .catch(() => {});
   }, [refreshTick]);
+
+  // Also refresh history right after closing the modal (badge clicked).
+  useEffect(() => {
+    const onModalSeen = () => {
+      fetch("/api/aha/history")
+        .then((r) => r.json())
+        .then((d) => setAhaHistory(d.items ?? []))
+        .catch(() => {});
+    };
+    window.addEventListener("synapse:open-aha", onModalSeen);
+    return () => window.removeEventListener("synapse:open-aha", onModalSeen);
+  }, []);
 
   // Listen for cross-component refresh signal (chat sent a message, files uploaded, etc.).
   useEffect(() => {
@@ -113,14 +153,20 @@ export function Sidebar() {
     return () => window.removeEventListener(REFRESH_EVENT, onRefresh);
   }, []);
 
-  // Restore previously connected folders from IndexedDB on mount.
+  // Clear folders whenever the logged-in user changes (logout / switch account).
+  useEffect(() => {
+    if (sessionStatus !== "loading") setFolders([]);
+  }, [userId, sessionStatus]);
+
+  // Restore previously connected folders from IndexedDB on mount (per user).
   // Permission status of "granted" → re-scan tree immediately.
   // Permission status of "prompt"/"denied" → show a "重新授权" button on the card.
   useEffect(() => {
+    if (!userId) return;
     let cancelled = false;
     (async () => {
       try {
-        const cached = await loadFolderHandles();
+        const cached = await loadFolderHandles(userId);
         if (cached.length === 0 || cancelled) return;
         const restored: SyncedFolder[] = [];
         for (const { name, handle } of cached) {
@@ -147,7 +193,7 @@ export function Sidebar() {
             name,
             rootHandle: handle,
             tree,
-            scannedAt: "已缓存",
+            scannedAt: t.sidebar.cached,
             totalFiles: total,
             permission: perm as SyncedFolder["permission"],
             fromCache: true,
@@ -159,7 +205,7 @@ export function Sidebar() {
       }
     })();
     return () => { cancelled = true; };
-  }, []);
+  }, [userId, t.sidebar.cached]);
 
   // Publish synced-files state to bus whenever folders/tree change.
   // chat-panel reads from the bus on each sendMessage to populate body.
@@ -222,9 +268,11 @@ export function Sidebar() {
         fromCache: false,
       };
       setFolders((prev) => [...prev.filter((f) => f.name !== handle.name), folderEntry]);
-      saveFolderHandle(handle.name, handle).catch((err) =>
-        console.warn("[sidebar] failed to cache folder handle:", err),
-      );
+      if (userId) {
+        saveFolderHandle(userId, handle.name, handle).catch((err) =>
+          console.warn("[sidebar] failed to cache folder handle:", err),
+        );
+      }
       setUploading(false);
     } catch (err: any) {
       if (err?.name !== "AbortError") console.error(err);
@@ -281,6 +329,20 @@ export function Sidebar() {
       });
     } else if (isText) {
       content = await file.text();
+    } else {
+      // Try office-doc parsing (pdf/docx/pptx/xlsx). Returns empty string if
+      // not supported.
+      try {
+        const { classifyKind, parsePdfToText, parseDocxToText, parsePptxToText, parseXlsxToText } =
+          await import("@/lib/synced-files");
+        const kind = classifyKind(file.name);
+        if (kind === "pdf") content = await parsePdfToText(file);
+        else if (kind === "docx") content = await parseDocxToText(file);
+        else if (kind === "pptx") content = await parsePptxToText(file);
+        else if (kind === "xlsx") content = await parseXlsxToText(file);
+      } catch (parseErr) {
+        console.error("[sidebar] file-input parse failed:", parseErr);
+      }
     }
     window.dispatchEvent(
       new CustomEvent("synapse:attach-file", {
@@ -299,9 +361,11 @@ export function Sidebar() {
 
   function removeFolder(name: string) {
     setFolders((prev) => prev.filter((f) => f.name !== name));
-    removeFolderHandle(name).catch((err) =>
-      console.warn("[sidebar] failed to remove cached handle:", err),
-    );
+    if (userId) {
+      removeFolderHandle(userId, name).catch((err) =>
+        console.warn("[sidebar] failed to remove cached handle:", err),
+      );
+    }
   }
 
   async function handleFileClick(node: TreeNode) {
@@ -319,6 +383,21 @@ export function Sidebar() {
         });
       } else if (node.isText) {
         content = await file.text();
+      } else if (node.isOffice) {
+        // PDF / docx / pptx / xlsx — parse on click so the content is inlined
+        // into the prompt instead of relying on LLM tool-call roundtrip.
+        const { classifyKind, parsePdfToText, parseDocxToText, parsePptxToText, parseXlsxToText } =
+          await import("@/lib/synced-files");
+        const kind = classifyKind(file.name);
+        try {
+          if (kind === "pdf") content = await parsePdfToText(file);
+          else if (kind === "docx") content = await parseDocxToText(file);
+          else if (kind === "pptx") content = await parsePptxToText(file);
+          else if (kind === "xlsx") content = await parseXlsxToText(file);
+        } catch (e) {
+          console.error("[sidebar] office parse failed:", e);
+          content = `[failed to parse ${node.name}: ${e instanceof Error ? e.message : String(e)}]`;
+        }
       } else {
         // unsupported binary — still let user attach by name
         content = "";
@@ -349,7 +428,7 @@ export function Sidebar() {
       display: "flex", flexDirection: "column", overflow: "hidden",
     }}>
       {/* Header */}
-      <div style={{ padding: "14px 16px 10px" }}>
+      <div style={{ padding: "14px 16px 10px", position: "relative" }}>
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img
           src="/logo-horizontal.jpg"
@@ -357,8 +436,32 @@ export function Sidebar() {
           style={{ height: 40, width: "auto", mixBlendMode: "multiply", display: "block", marginLeft: -4 }}
         />
         <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4 }}>
-          {data ? `${data.l1Count} 条记忆 · ${Math.round(data.l0Count / 2)} 轮` : "载入中…"}
+          {data ? t.sidebar.memoryStats(data.l1Count, Math.round(data.l0Count / 2)) : t.sidebar.loadingStats}
         </div>
+        {ahaUnseen && (
+          <button
+            onClick={() => {
+              window.dispatchEvent(new CustomEvent("synapse:open-aha"));
+              // Optimistically clear; server is updated by the modal.
+              setAhaUnseen(false);
+            }}
+            title={t.sidebar.newInsightTitle}
+            style={{
+              position: "absolute", top: 12, right: 14,
+              background: "linear-gradient(135deg, #FFE5B0 0%, #F5C57E 100%)",
+              border: "1px solid #D6A84F",
+              borderRadius: 14,
+              padding: "3px 9px 3px 7px",
+              fontSize: 11, fontWeight: 700, color: "#7A5A10",
+              cursor: "pointer",
+              boxShadow: "0 2px 6px rgba(214, 168, 79, 0.35)",
+              display: "flex", alignItems: "center", gap: 4,
+              animation: "synapse-pulse 1.8s ease-in-out infinite",
+            }}
+          >
+            ✨ <span>{t.sidebar.newInsight}</span>
+          </button>
+        )}
       </div>
 
       {/* Search */}
@@ -372,7 +475,7 @@ export function Sidebar() {
           <input
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="搜索记忆…"
+            placeholder={t.sidebar.searchPlaceholder}
             style={{
               flex: 1, background: "none", border: "none", outline: "none",
               color: "var(--text)", fontSize: 13, fontFamily: "inherit",
@@ -392,9 +495,9 @@ export function Sidebar() {
 
         {/* Search Results */}
         {searchResults !== null && (
-          <Section label={`搜索结果 (${searchResults.length})`}>
+          <Section label={t.sidebar.searchResults(searchResults.length)}>
             {searchResults.length === 0 ? (
-              <div style={{ padding: "8px 14px", fontSize: 12, color: "var(--text-muted)" }}>无匹配记忆</div>
+              <div style={{ padding: "8px 14px", fontSize: 12, color: "var(--text-muted)" }}>{t.sidebar.noResults}</div>
             ) : (
               searchResults.slice(0, 10).map((m) => <MemoryRow key={m.id} m={m} />)
             )}
@@ -403,7 +506,7 @@ export function Sidebar() {
 
         {/* Local Folders */}
         {searchResults === null && (
-          <Section label="本地文件夹">
+          <Section label={t.sidebar.localFolders}>
             {folders.map((f) => (
               <FolderTree
                 key={f.name}
@@ -426,29 +529,38 @@ export function Sidebar() {
                 fontWeight: uploading ? 400 : 600,
               }}
             >
-              {uploading ? "扫描中…" : "+ 连接文件夹"}
+              {uploading ? t.sidebar.scanning : t.sidebar.connectFolder}
             </button>
-            <input ref={fileInputRef} type="file" accept=".txt,.md,.pdf,.tex,.csv" style={{ display: "none" }} onChange={handleFileInput} />
+            <input ref={fileInputRef} type="file" accept=".txt,.md,.pdf,.tex,.csv,.docx,.pptx,.xlsx,.xls,.json,.yaml,.yml,.rst" style={{ display: "none" }} onChange={handleFileInput} />
+          </Section>
+        )}
+
+        {/* Aha History — every detected Aha, clickable to re-open in modal */}
+        {searchResults === null && ahaHistory.length > 0 && (
+          <Section label={`✨ ${t.sidebar.ahaHistory(ahaHistory.length)}`}>
+            {ahaHistory.slice(0, 10).map((item) => (
+              <AhaHistoryRow key={item.id} item={item} locale={locale} />
+            ))}
           </Section>
         )}
 
         {/* L3 Persona — link to /persona */}
         {searchResults === null && data?.persona && (
-          <Section label="个人画像 (L3)">
+          <Section label={t.sidebar.persona}>
             <PersonaLink />
           </Section>
         )}
 
         {/* L2 Scenes — each row links to /scenes/[filename] */}
         {searchResults === null && data && data.scenes.length > 0 && (
-          <Section label={`主题场景 (L2 · ${data.scenes.length})`}>
+          <Section label={t.sidebar.scenes(data.scenes.length)}>
             {data.scenes.map((scene) => <SceneRow key={scene.filename} scene={scene} />)}
           </Section>
         )}
 
         {/* Recent Memories — each row links to /memories/[id] */}
         {searchResults === null && data && data.recentMemories.length > 0 && (
-          <Section label={`最近记忆 (L1 · ${data.recentMemories.length})`}>
+          <Section label={t.sidebar.recentMemories(data.recentMemories.length)}>
             {data.recentMemories.slice(0, 15).map((m) => <MemoryRow key={m.id} m={m} />)}
           </Section>
         )}
@@ -457,17 +569,20 @@ export function Sidebar() {
           <div style={{ padding: "20px 14px", textAlign: "center" }}>
             <div style={{ fontSize: 28, marginBottom: 8 }}>🌱</div>
             <div style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.6 }}>
-              开始对话后，Synapse 会在这里积累你的工作记忆。
+              {t.sidebar.emptyMemories}
             </div>
           </div>
         )}
       </div>
+      <AccountCenter />
     </div>
   );
 }
 
 function MemoryRow({ m }: { m: { id: string; content: string; type: string; scene_name?: string } }) {
-  const cfg = TYPE_CONFIG[m.type] ?? { color: "#6B7280", label: m.type };
+  const { t } = useI18n();
+  const color = TYPE_COLORS[m.type] ?? "#6B7280";
+  const label = (t.typeLabels as Record<string, string>)[m.type] ?? m.type;
   return (
     <a
       href={`/memories/${encodeURIComponent(m.id)}`}
@@ -493,10 +608,10 @@ function MemoryRow({ m }: { m: { id: string; content: string; type: string; scen
       <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 3 }}>
         <span style={{
           fontSize: 10, padding: "1px 5px",
-          background: `${cfg.color}18`, color: cfg.color,
+          background: `${color}18`, color,
           borderRadius: 4, fontWeight: 600, flexShrink: 0,
         }}>
-          {cfg.label}
+          {label}
         </span>
         {m.scene_name && (
           <span style={{
@@ -554,7 +669,51 @@ function SceneRow({ scene }: { scene: SceneBlock }) {
   );
 }
 
+function AhaHistoryRow({ item, locale }: { item: AhaHistoryItem; locale: string }) {
+  const { t } = useI18n();
+  const date = item.detectedAt
+    ? new Date(item.detectedAt).toLocaleString(locale, {
+        month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+      })
+    : "";
+  return (
+    <button
+      onClick={() =>
+        window.dispatchEvent(
+          new CustomEvent("synapse:open-aha", { detail: { id: item.id } }),
+        )
+      }
+      title={item.observation}
+      style={{
+        display: "block", width: "calc(100% - 12px)", margin: "2px 6px",
+        padding: "7px 10px",
+        background: "transparent", border: "none",
+        textAlign: "left", cursor: "pointer", borderRadius: 6,
+        transition: "background 0.12s",
+        color: "inherit", fontFamily: "inherit",
+      }}
+      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--insight)")}
+      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 3 }}>
+        <span style={{ fontSize: 11 }}>✨</span>
+        <span style={{
+          fontSize: 10, color: "var(--text-muted)",
+        }}>{date}</span>
+      </div>
+      <div style={{
+        fontSize: 12, color: "var(--text)", lineHeight: 1.45,
+        display: "-webkit-box", WebkitBoxOrient: "vertical", WebkitLineClamp: 2,
+        overflow: "hidden",
+      }}>
+        {item.pattern || item.observation || t.common.none}
+      </div>
+    </button>
+  );
+}
+
 function PersonaLink() {
+  const { t } = useI18n();
   return (
     <div style={{ padding: "2px 12px 6px" }}>
       <Link
@@ -570,7 +729,7 @@ function PersonaLink() {
         onMouseEnter={(e) => (e.currentTarget.style.background = "var(--insight)")}
         onMouseLeave={(e) => (e.currentTarget.style.background = "var(--surface)")}
       >
-        📖 查看完整画像 →
+        {t.sidebar.viewPersona}
       </Link>
     </div>
   );
@@ -590,6 +749,327 @@ function Section({ label, children }: { label: string; children: React.ReactNode
   );
 }
 
+function AccountCenter() {
+  const { language, setLanguage, apiSettings, setApiSettings, t } = useI18n();
+  const { data: session } = useSession();
+  const [open, setOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const displayName = session?.user?.name || session?.user?.email || t.account.name;
+  const displayEmail = session?.user?.email || t.account.plan;
+  const avatarLetter = (displayName || displayEmail || "S").slice(0, 1).toUpperCase();
+
+  return (
+    <div style={{ position: "relative", borderTop: "1px solid var(--border)", padding: 10 }}>
+      {open && (
+        <div
+          style={{
+            position: "absolute",
+            left: 10,
+            bottom: 72,
+            width: 252,
+            background: "var(--surface)",
+            border: "1px solid var(--border)",
+            borderRadius: 14,
+            boxShadow: "0 16px 40px rgba(0,0,0,0.16)",
+            padding: 8,
+            zIndex: 40,
+          }}
+        >
+          <div style={{ padding: "8px 10px 7px", fontSize: 12, color: "var(--text-muted)" }}>
+            {displayEmail}
+          </div>
+          <AccountMenuButton icon="⚙" label={t.account.settings} />
+          <button
+            onClick={() => setLanguage(language === "en" ? "zh" : "en")}
+            style={accountMenuButtonStyle}
+          >
+            <span style={accountIconStyle}>🌐</span>
+            <span style={{ flex: 1 }}>{t.account.language}</span>
+            <span style={{ color: "var(--text-muted)", fontSize: 12 }}>
+              {language === "en" ? t.account.english : t.account.chinese}
+            </span>
+          </button>
+          <button
+            onClick={() => setSettingsOpen(true)}
+            style={accountMenuButtonStyle}
+          >
+            <span style={accountIconStyle}>🔑</span>
+            <span style={{ flex: 1 }}>{t.account.apiSettings}</span>
+            <span style={{ color: "var(--text-muted)" }}>›</span>
+          </button>
+          <div style={{ height: 1, background: "var(--border)", margin: "7px 4px" }} />
+          <button
+            onClick={() => signOut({ callbackUrl: "/login" })}
+            style={accountMenuButtonStyle}
+          >
+            <span style={accountIconStyle}>↪</span>
+            <span style={{ flex: 1 }}>{t.account.logout}</span>
+          </button>
+        </div>
+      )}
+
+      <button
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          background: open ? "var(--surface)" : "transparent",
+          border: "none",
+          borderRadius: 10,
+          padding: "8px 7px",
+          color: "var(--text)",
+          cursor: "pointer",
+          textAlign: "left",
+        }}
+      >
+        <span style={{
+          width: 34,
+          height: 34,
+          borderRadius: "50%",
+          background: "#1f1f1f",
+          color: "#fff",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontSize: 15,
+          fontWeight: 700,
+          flexShrink: 0,
+        }}>{avatarLetter}</span>
+        <span style={{ flex: 1, minWidth: 0 }}>
+          <span style={{ display: "block", fontSize: 13, fontWeight: 700, lineHeight: 1.2 }}>
+            {displayName}
+          </span>
+          <span style={{ display: "block", fontSize: 11, color: "var(--text-muted)", lineHeight: 1.2 }}>
+            {displayEmail}
+          </span>
+        </span>
+        <span style={{ color: "var(--text-muted)", fontSize: 14 }}>⌄</span>
+      </button>
+
+      {settingsOpen && (
+        <ApiSettingsModal
+          initial={apiSettings}
+          onClose={() => setSettingsOpen(false)}
+          onSave={(next) => {
+            setApiSettings(next);
+            setSettingsOpen(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function AccountMenuButton({ icon, label }: { icon: string; label: string }) {
+  return (
+    <button type="button" style={accountMenuButtonStyle}>
+      <span style={accountIconStyle}>{icon}</span>
+      <span style={{ flex: 1 }}>{label}</span>
+    </button>
+  );
+}
+
+function ApiSettingsModal({
+  initial,
+  onClose,
+  onSave,
+}: {
+  initial: ApiSettings;
+  onClose: () => void;
+  onSave: (settings: ApiSettings) => void;
+}) {
+  const { t } = useI18n();
+  const [draft, setDraft] = useState<ApiSettings>(initial);
+
+  const update = (key: keyof ApiSettings, value: string) => {
+    setDraft((prev) => ({ ...prev, [key]: value }));
+  };
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed",
+        inset: 0,
+        zIndex: 300,
+        background: "rgba(20, 20, 18, 0.42)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        padding: 24,
+      }}
+    >
+      <section
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "min(520px, 100%)",
+          background: "var(--surface)",
+          border: "1px solid var(--border)",
+          borderRadius: 14,
+          boxShadow: "0 24px 60px rgba(0,0,0,0.24)",
+          overflow: "hidden",
+        }}
+      >
+        <header style={{
+          padding: "16px 20px 12px",
+          borderBottom: "1px solid var(--border)",
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 16,
+        }}>
+          <div>
+            <h2 style={{ fontSize: 17, margin: 0, color: "var(--text)" }}>{t.apiSettings.title}</h2>
+            <p style={{ fontSize: 12, color: "var(--text-muted)", marginTop: 4, lineHeight: 1.5 }}>
+              {t.apiSettings.description}
+            </p>
+          </div>
+          <button
+            onClick={onClose}
+            aria-label={t.common.close}
+            style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer", fontSize: 20, lineHeight: 1 }}
+          >×</button>
+        </header>
+
+        <div style={{ padding: 20, display: "grid", gap: 14 }}>
+          <SettingsField
+            label={t.apiSettings.apiKey}
+            value={draft.apiKey}
+            placeholder={t.apiSettings.apiKeyPlaceholder}
+            type="password"
+            onChange={(value) => update("apiKey", value)}
+          />
+          <SettingsField
+            label={t.apiSettings.baseUrl}
+            value={draft.baseUrl}
+            placeholder={t.apiSettings.baseUrlPlaceholder}
+            onChange={(value) => update("baseUrl", value)}
+          />
+          <SettingsField
+            label={t.apiSettings.model}
+            value={draft.model}
+            placeholder={t.apiSettings.modelPlaceholder}
+            onChange={(value) => update("model", value)}
+          />
+        </div>
+
+        <footer style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          padding: "12px 20px 18px",
+          borderTop: "1px solid var(--border)",
+        }}>
+          <button
+            onClick={() => setDraft({ apiKey: "", baseUrl: "", model: "" })}
+            style={{
+              border: "none",
+              background: "transparent",
+              color: "var(--text-muted)",
+              cursor: "pointer",
+              fontSize: 13,
+            }}
+          >
+            {t.apiSettings.clear}
+          </button>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={onClose}
+              style={{
+                padding: "8px 14px",
+                borderRadius: 8,
+                border: "1px solid var(--border)",
+                background: "var(--surface-2)",
+                color: "var(--text-muted)",
+                cursor: "pointer",
+                fontSize: 13,
+              }}
+            >
+              {t.common.cancel}
+            </button>
+            <button
+              onClick={() => onSave(draft)}
+              style={{
+                padding: "8px 16px",
+                borderRadius: 8,
+                border: "none",
+                background: "var(--accent)",
+                color: "#fff",
+                cursor: "pointer",
+                fontSize: 13,
+                fontWeight: 700,
+              }}
+            >
+              {t.common.save}
+            </button>
+          </div>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function SettingsField({
+  label,
+  value,
+  placeholder,
+  type = "text",
+  onChange,
+}: {
+  label: string;
+  value: string;
+  placeholder: string;
+  type?: "text" | "password";
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label style={{ display: "grid", gap: 6 }}>
+      <span style={{ fontSize: 12, fontWeight: 700, color: "var(--text)" }}>{label}</span>
+      <input
+        type={type}
+        value={value}
+        placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value)}
+        style={{
+          width: "100%",
+          padding: "10px 11px",
+          border: "1px solid var(--border)",
+          borderRadius: 8,
+          background: "var(--surface-2)",
+          color: "var(--text)",
+          outline: "none",
+          fontSize: 13,
+          fontFamily: "inherit",
+        }}
+      />
+    </label>
+  );
+}
+
+const accountMenuButtonStyle: React.CSSProperties = {
+  width: "100%",
+  display: "flex",
+  alignItems: "center",
+  gap: 10,
+  border: "none",
+  background: "transparent",
+  color: "var(--text)",
+  padding: "9px 10px",
+  borderRadius: 8,
+  cursor: "pointer",
+  fontSize: 14,
+  textAlign: "left",
+  fontFamily: "inherit",
+};
+
+const accountIconStyle: React.CSSProperties = {
+  width: 18,
+  color: "var(--text-muted)",
+  textAlign: "center",
+  flexShrink: 0,
+};
+
 async function scanTree(
   dirHandle: any,
   path: string,
@@ -603,9 +1083,9 @@ async function scanTree(
       if (handle.kind === "directory") {
         children.push(await scanTree(handle, childPath, onFile));
       } else {
-        const { isText, isImage } = classifyFile(name);
+        const { isText, isImage, isOffice } = classifyFile(name);
         children.push({
-          name, path: childPath, kind: "file", handle, isText, isImage,
+          name, path: childPath, kind: "file", handle, isText, isImage, isOffice,
         });
         onFile?.();
       }
@@ -638,24 +1118,51 @@ function FolderTree({
   onRemove: () => void;
   onReauthorize: () => void;
 }) {
+  const { t } = useI18n();
   const [expanded, setExpanded] = useState(true);
+  const [hovered, setHovered] = useState(false);
+  const [copied, setCopied] = useState(false);
   const needsAuth = folder.permission !== "granted";
   const scanning = scanInProgress !== undefined;
   const statusLine = needsAuth
-    ? "需重新授权"
+    ? t.sidebar.needsAuth
     : scanning
-      ? `扫描中… 已发现 ${scanInProgress} 个`
-      : "已就绪";
+      ? t.sidebar.scanProgress(scanInProgress)
+      : t.sidebar.ready;
+
+  async function copyRootPath(e: React.MouseEvent) {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(folder.name);
+    } catch {
+      const ta = document.createElement("textarea");
+      ta.value = folder.name;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch { /* ignore */ }
+      document.body.removeChild(ta);
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1200);
+  }
+
   return (
     <div style={{ padding: "2px 8px 6px" }}>
       <div
+        title={folder.name}
         style={{
           display: "flex", alignItems: "center", gap: 4,
           padding: "4px 6px", borderRadius: 6,
           cursor: "pointer", userSelect: "none",
         }}
-        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--surface)")}
-        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+        onMouseEnter={(e) => {
+          e.currentTarget.style.background = "var(--surface)";
+          setHovered(true);
+        }}
+        onMouseLeave={(e) => {
+          e.currentTarget.style.background = "transparent";
+          setHovered(false);
+        }}
       >
         <span
           onClick={() => setExpanded((v) => !v)}
@@ -681,9 +1188,29 @@ function FolderTree({
             {statusLine}
           </div>
         </div>
+        {(hovered || copied) && (
+          <button
+            onClick={copyRootPath}
+            title={t.sidebar.copyPath(folder.name)}
+            aria-label={t.sidebar.copyPathLabel}
+            style={{
+              background: copied ? "var(--accent)" : "var(--surface)",
+              border: "1px solid var(--border)",
+              borderRadius: 4,
+              padding: "1px 5px",
+              fontSize: 10,
+              color: copied ? "#fff" : "var(--text-muted)",
+              cursor: "pointer",
+              lineHeight: 1.2,
+              flexShrink: 0,
+            }}
+          >
+            {copied ? t.common.copied : `📋 ${t.common.path}`}
+          </button>
+        )}
         <button
           onClick={(e) => { e.stopPropagation(); onRemove(); }}
-          title="移除"
+          title={t.sidebar.remove}
           style={{
             background: "none", border: "none", cursor: "pointer",
             color: "var(--text-muted)", fontSize: 14, padding: 2, lineHeight: 1,
@@ -700,7 +1227,7 @@ function FolderTree({
             fontSize: 11, fontWeight: 600,
           }}
         >
-          重新授权访问
+          {t.sidebar.reauthorize}
         </button>
       )}
       {expanded && folder.tree?.children && (
@@ -721,20 +1248,48 @@ function TreeNodeView({
   depth: number;
   onFileClick: (node: TreeNode) => void;
 }) {
+  const { t } = useI18n();
   const [expanded, setExpanded] = useState(depth < 1);
+  const [hovered, setHovered] = useState(false);
+  const [copied, setCopied] = useState(false);
   const indent = depth * 10;
+
+  async function copyPath(e: React.MouseEvent) {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(node.path);
+    } catch {
+      // Older browsers: fallback via temporary input
+      const ta = document.createElement("textarea");
+      ta.value = node.path;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch { /* ignore */ }
+      document.body.removeChild(ta);
+    }
+    setCopied(true);
+    setTimeout(() => setCopied(false), 1200);
+  }
+
   if (node.kind === "directory") {
     return (
       <div>
         <div
           onClick={() => setExpanded((v) => !v)}
+          title={node.path}
           style={{
             display: "flex", alignItems: "center", gap: 4,
             padding: "3px 6px", paddingLeft: 6 + indent,
             cursor: "pointer", borderRadius: 5, userSelect: "none",
           }}
-          onMouseEnter={(e) => (e.currentTarget.style.background = "var(--surface)")}
-          onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.background = "var(--surface)";
+            setHovered(true);
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.background = "transparent";
+            setHovered(false);
+          }}
         >
           <span style={{
             width: 10, fontSize: 8, color: "var(--text-muted)",
@@ -742,16 +1297,37 @@ function TreeNodeView({
             transition: "transform 0.12s",
             display: "inline-block", textAlign: "center",
           }}>▶</span>
-          <span style={{ fontSize: 12 }}>📂</span>
+          <span style={{ fontSize: 12, flexShrink: 0 }}>📂</span>
           <span
             onClick={(e) => e.stopPropagation()}
             style={{
               fontSize: 12, color: "var(--text)",
               overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
               userSelect: "text", cursor: "text",
+              flex: 1, minWidth: 0,
             }}
           >{node.name}</span>
-          <span style={{ fontSize: 10, color: "var(--text-muted)", marginLeft: "auto", flexShrink: 0 }}>
+          {(hovered || copied) && (
+            <button
+              onClick={copyPath}
+              title={t.sidebar.copyPath(node.path)}
+              aria-label={t.sidebar.copyPathLabel}
+              style={{
+                background: copied ? "var(--accent)" : "var(--surface)",
+                border: "1px solid var(--border)",
+                borderRadius: 4,
+                padding: "1px 5px",
+                fontSize: 10,
+                color: copied ? "#fff" : "var(--text-muted)",
+                cursor: "pointer",
+                lineHeight: 1.2,
+                flexShrink: 0,
+              }}
+            >
+              {copied ? t.common.copied : `📋 ${t.common.path}`}
+            </button>
+          )}
+          <span style={{ fontSize: 10, color: "var(--text-muted)", flexShrink: 0 }}>
             {node.children?.length ?? 0}
           </span>
         </div>
@@ -765,31 +1341,68 @@ function TreeNodeView({
       </div>
     );
   }
-  const clickable = node.isText || node.isImage;
-  const icon = node.isImage ? "🖼️" : node.isText ? "📄" : "📦";
+  const clickable = node.isText || node.isImage || node.isOffice;
+  const icon = node.isImage
+    ? "🖼️"
+    : node.isText
+      ? "📄"
+      : node.isOffice
+        ? (node.name.toLowerCase().endsWith(".pdf") ? "📕"
+            : node.name.toLowerCase().endsWith(".docx") ? "📘"
+            : node.name.toLowerCase().endsWith(".pptx") ? "📙"
+            : "📊")
+        : "📦";
   return (
     <div
       onClick={() => clickable && onFileClick(node)}
-      title={clickable ? "点击挂到输入框，针对此文件提问" : "暂不支持该文件类型"}
+      title={clickable ? t.sidebar.fileTitleClickable(node.path) : t.sidebar.fileTitleUnsupported(node.path)}
       style={{
         display: "flex", alignItems: "center", gap: 4,
         padding: "3px 6px", paddingLeft: 20 + indent,
         cursor: clickable ? "pointer" : "default",
         borderRadius: 5, userSelect: "none",
         opacity: clickable ? 1 : 0.45,
+        position: "relative",
       }}
-      onMouseEnter={(e) => { if (clickable) e.currentTarget.style.background = "var(--insight)"; }}
-      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+      onMouseEnter={(e) => {
+        if (clickable) e.currentTarget.style.background = "var(--insight)";
+        setHovered(true);
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.background = "transparent";
+        setHovered(false);
+      }}
     >
-      <span style={{ fontSize: 11 }}>{icon}</span>
+      <span style={{ fontSize: 11, flexShrink: 0 }}>{icon}</span>
       <span
         onClick={(e) => e.stopPropagation()}
         style={{
           fontSize: 12, color: "var(--text-muted)",
           overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
           userSelect: "text", cursor: "text",
+          flex: 1, minWidth: 0,
         }}
       >{node.name}</span>
+      {(hovered || copied) && (
+        <button
+          onClick={copyPath}
+          title={t.sidebar.copyPath(node.path)}
+          aria-label={t.sidebar.copyPathLabel}
+          style={{
+            background: copied ? "var(--accent)" : "var(--surface)",
+            border: "1px solid var(--border)",
+            borderRadius: 4,
+            padding: "1px 5px",
+            fontSize: 10,
+            color: copied ? "#fff" : "var(--text-muted)",
+            cursor: "pointer",
+            lineHeight: 1.2,
+            flexShrink: 0,
+          }}
+        >
+          {copied ? t.common.copied : `📋 ${t.common.path}`}
+        </button>
+      )}
     </div>
   );
 }

@@ -20,7 +20,7 @@
  */
 "use client";
 
-import { useMemo, useCallback } from "react";
+import { useEffect, useMemo } from "react";
 import {
   ReactFlow,
   ReactFlowProvider,
@@ -29,15 +29,26 @@ import {
   Controls,
   Handle,
   Position,
+  useNodesState,
+  useEdgesState,
   type Node,
   type Edge,
   type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
+import { useI18n, type TranslationSet } from "./i18n";
 
 // ──────────────────────────────────────
 // Types
 // ──────────────────────────────────────
+
+export interface ExternalSource {
+  title: string;
+  abstract: string;
+  source: "semantic_scholar" | "arxiv";
+  url?: string;
+  year?: number;
+}
 
 export interface AhaPayload {
   pattern: string;
@@ -45,6 +56,7 @@ export interface AhaPayload {
   hypothesis: string;
   reframe: string;
   supportingMemoryIds: string[];
+  externalSources?: ExternalSource[];
   detectedAt: string;
 }
 
@@ -83,7 +95,7 @@ export interface EvidenceData {
 
 export type SelectedDetail =
   | { kind: "top"; aha: AhaPayload }
-  | { kind: "scene"; scene: ScenePayload | { filename: null; title: "杂项"; summary: string; memoryCount: number; maxPriority: number; heat: number } }
+  | { kind: "scene"; scene: ScenePayload | { filename: null; title: string; summary: string; memoryCount: number; maxPriority: number; heat: number } }
   | { kind: "memory"; memory: MemoryPayload; conversations: ConversationPayload[]; sceneAccent: string };
 
 interface Props {
@@ -145,6 +157,9 @@ function shortText(s: string, limit: number) {
 interface TopNodeData {
   observationSnippet: string;
   count: number;
+  noticedLabel: string;
+  evidenceLabel: string;
+  clickLabel: string;
   onClick: () => void;
 }
 
@@ -172,7 +187,7 @@ function TopNode({ data }: NodeProps) {
         textTransform: "uppercase", letterSpacing: 1.2, marginBottom: 10,
       }}>
         <span style={{ fontSize: 13 }}>✨</span>
-        <span>Synapse 注意到</span>
+        <span>{d.noticedLabel}</span>
       </div>
       <div style={{
         fontSize: 13.5, lineHeight: 1.65, color: COLORS.text, fontWeight: 450,
@@ -183,8 +198,8 @@ function TopNode({ data }: NodeProps) {
         marginTop: 12, paddingTop: 10, borderTop: `1px solid ${COLORS.border}`,
         fontSize: 11, color: COLORS.textMuted, display: "flex", justifyContent: "space-between",
       }}>
-        <span>{d.count} 条证据</span>
-        <span style={{ color: COLORS.accent, fontWeight: 600 }}>点击展开 →</span>
+        <span>{d.evidenceLabel}</span>
+        <span style={{ color: COLORS.accent, fontWeight: 600 }}>{d.clickLabel}</span>
       </div>
       <Handle type="source" position={Position.Bottom} style={{ opacity: 0 }} />
     </div>
@@ -198,6 +213,8 @@ interface SceneNodeData {
   maxPriority: number;
   accent: typeof SCENE_ACCENTS[number];
   isMisc: boolean;
+  miscLabel: string;
+  sceneLabel: string;
   onClick: () => void;
 }
 
@@ -224,7 +241,7 @@ function SceneNode({ data }: NodeProps) {
         fontSize: 10, fontWeight: 700, color: a.stripe, marginBottom: 6,
         textTransform: "uppercase", letterSpacing: 1,
       }}>
-        {d.isMisc ? "杂项" : "主题场景"}
+        {d.isMisc ? d.miscLabel : d.sceneLabel}
       </div>
       <div style={{
         fontSize: 14, fontWeight: 600, color: a.text,
@@ -329,13 +346,16 @@ const MEMORY_GAP_Y = 12;
 const MEMS_PER_ROW = 4;
 const SCENE_W = 280;
 const SCENE_GAP = 80;
-const SCENE_Y = 220;
-const MEMORY_BLOCK_Y = 370;
+const TOP_NODE_H = 240;   // ample room for a 4-5 line observation + footer
+const SCENE_Y = TOP_NODE_H + 60;       // 300
+const SCENE_NODE_H = 160;              // scene card incl. heading + summary + stats
+const MEMORY_BLOCK_Y = SCENE_Y + SCENE_NODE_H + 40; // 500
 
 function buildGraph(
   aha: AhaPayload,
   evidence: EvidenceData,
   onSelect: (d: SelectedDetail) => void,
+  t: TranslationSet,
 ): { nodes: Node[]; edges: Edge[] } {
   const nodes: Node[] = [];
   const edges: Edge[] = [];
@@ -391,6 +411,9 @@ function buildGraph(
     data: {
       observationSnippet: shortText(aha.observation, 130),
       count: aha.supportingMemoryIds.length,
+      noticedLabel: t.aha.noticed,
+      evidenceLabel: t.aha.evidenceCount(aha.supportingMemoryIds.length),
+      clickLabel: t.aha.clickExpand,
       onClick: () => onSelect({ kind: "top", aha }),
     } satisfies TopNodeData as unknown as Record<string, unknown>,
   });
@@ -408,20 +431,22 @@ function buildGraph(
       type: "sceneNode",
       position: { x: sceneX, y: SCENE_Y },
       data: {
-        title: scene?.title ?? "杂项",
-        summary: scene?.summary ?? `${mems.length} 条记忆未能匹配到任何主题场景`,
+        title: scene?.title ?? t.aha.misc,
+        summary: scene?.summary ?? t.aha.miscSummary(mems.length),
         memoryCount: scene?.memoryCount ?? mems.length,
         maxPriority: scene?.maxPriority ?? Math.max(...mems.map((m) => m.priority ?? 0)),
         accent,
         isMisc: !scene,
+        miscLabel: t.aha.misc,
+        sceneLabel: t.aha.scene,
         onClick: () => onSelect({
           kind: "scene",
           scene: scene
             ? scene
             : {
                 filename: null,
-                title: "杂项",
-                summary: `${mems.length} 条记忆未能匹配到任何主题场景`,
+                title: t.aha.misc,
+                summary: t.aha.miscSummary(mems.length),
                 memoryCount: mems.length,
                 maxPriority: Math.max(...mems.map((m) => m.priority ?? 0)),
                 heat: 0,
@@ -484,12 +509,21 @@ function buildGraph(
 // ──────────────────────────────────────
 
 export function EvidenceGraph({ aha, evidence, onSelect }: Props) {
-  const { nodes, edges } = useMemo(
-    () => buildGraph(aha, evidence, onSelect),
-    [aha, evidence, onSelect],
+  const { t } = useI18n();
+  const initial = useMemo(
+    () => buildGraph(aha, evidence, onSelect, t),
+    [aha, evidence, onSelect, t],
   );
 
-  const noop = useCallback(() => {}, []);
+  const [nodes, setNodes, onNodesChange] = useNodesState(initial.nodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(initial.edges);
+
+  // Re-sync local state when the underlying aha/evidence changes.
+  // Without this, switching to a different historic Aha keeps the old graph.
+  useEffect(() => {
+    setNodes(initial.nodes);
+    setEdges(initial.edges);
+  }, [initial, setNodes, setEdges]);
 
   return (
     <div style={{ width: "100%", height: "100%", background: COLORS.bg }}>
@@ -498,8 +532,8 @@ export function EvidenceGraph({ aha, evidence, onSelect }: Props) {
           nodes={nodes}
           edges={edges}
           nodeTypes={nodeTypes}
-          onNodesChange={noop}
-          onEdgesChange={noop}
+          onNodesChange={onNodesChange}
+          onEdgesChange={onEdgesChange}
           fitView
           fitViewOptions={{ padding: 0.18, includeHiddenNodes: false }}
           minZoom={0.3}
