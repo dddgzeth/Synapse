@@ -16,6 +16,7 @@ async function main() {
     return;
   }
   await runL2L3Pipeline({
+    userId: process.env.SYNAPSE_USER_ID ?? "_anon",
     newMemories: all.map((m) => ({ id: m.id, content: m.content, createdAt: m.createdAt })),
   });
 
