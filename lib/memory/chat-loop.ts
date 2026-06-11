@@ -78,7 +78,6 @@ export interface RunChatLoopParams {
   baseURL: string;          // e.g. "https://www.fucheers.top/v1"
   apiKey: string;
   model: string;            // e.g. "claude-sonnet-4-6"
-  maxTokens?: number;
   maxSteps?: number;
   timeoutMs?: number;
   /** Hook to rewrite outgoing body (e.g. for vision attachments). */
@@ -168,7 +167,8 @@ async function compactOnce(
       body: JSON.stringify({
         model,
         stream: false,
-        max_tokens: 1500,
+        // No max_tokens — the prompt asks for a dense summary, let the model
+        // decide its own length so important facts aren't cut off.
         messages: [
           {
             role: "system",
@@ -176,8 +176,7 @@ async function compactOnce(
               "You compress a tool's raw output into a dense factual summary. " +
               "Keep ALL named entities, numbers, file paths, conclusions, decisions, and specific claims. " +
               "Drop boilerplate, repetition, and prose decoration. " +
-              "Output only the summary — no preface, no meta-commentary. " +
-              "Target: 1500 tokens.",
+              "Output only the summary — no preface, no meta-commentary.",
           },
           {
             role: "user",
@@ -256,7 +255,6 @@ export async function runChatLoop(params: RunChatLoopParams): Promise<ChatLoopRe
   const {
     systemPrompt, messages: initialMessages, tools,
     baseURL, apiKey, model,
-    maxTokens = 4096,
     maxSteps = 20,
     // Per-step timeout is adaptive (see computeStepTimeout below). The static
     // `timeoutMs` only acts as an upper cap.
@@ -275,7 +273,8 @@ export async function runChatLoop(params: RunChatLoopParams): Promise<ChatLoopRe
       const body: any = {
         model,
         stream: false,
-        max_tokens: maxTokens,
+        // No max_tokens — let the model run to completion. The proxy will
+        // honour the model's own default cap.
         messages: [
           { role: "system", content: systemPrompt },
           ...messages,
@@ -286,9 +285,11 @@ export async function runChatLoop(params: RunChatLoopParams): Promise<ChatLoopRe
         body.tool_choice = "auto";
       }
       const promptChars = totalMessageChars(messages, systemPrompt);
+      // Budget for generation time without a maxTokens hint: assume up to
+      // ~30k token output (worst case ≈ 5 minutes streaming).
       const adaptiveTimeout = Math.min(
         timeoutMs,
-        30_000 + promptChars * 5 + (maxTokens / 1000) * 30_000,
+        30_000 + promptChars * 5 + 240_000,
       );
       onEvent?.({ kind: "step-start", step, promptChars, budgetMs: adaptiveTimeout });
       const controller = new AbortController();

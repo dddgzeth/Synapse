@@ -101,10 +101,27 @@ function SceneDetail({ detail }: { detail: Extract<SelectedDetail, { kind: "scen
 
 function MemoryDetail({ detail }: { detail: Extract<SelectedDetail, { kind: "memory" }> }) {
   const { t, locale } = useI18n();
-  const { memory, conversations } = detail;
+  const { memory, conversations, sceneAccent } = detail;
   return (
     <>
-      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+      {memory.scene_name && (
+        <div style={{
+          marginBottom: 14,
+          padding: "8px 12px",
+          background: `${sceneAccent}12`,
+          border: `1px solid ${sceneAccent}40`,
+          borderLeft: `4px solid ${sceneAccent}`,
+          borderRadius: 6,
+          fontSize: 13,
+          fontWeight: 600,
+          color: sceneAccent,
+          lineHeight: 1.5,
+          wordBreak: "break-word",
+        }}>
+          {memory.scene_name}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
         <Stat label={t.aha.type} value={memory.type} />
         <Stat label={t.aha.priority} value={`P${memory.priority}`} />
         <Stat label={t.aha.created} value={new Date(memory.createdAt).toLocaleDateString(locale)} />

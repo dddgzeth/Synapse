@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-60 -60 120 120" width="400" height="400" style="background:#f5f0e8">
+  <circle cx="0" cy="0" r="42" fill="#D97757" opacity="0.14" />
+  <circle cx="0" cy="0" r="32" fill="#D97757" opacity="0.20" />
+  <path d="M -20 -8 Q -28 -16 -32 -22" stroke="#A04A2A" stroke-width="3" fill="none" stroke-linecap="round" />
+  <path d="M 20 -8 Q 28 -16 32 -22" stroke="#A04A2A" stroke-width="3" fill="none" stroke-linecap="round" />
+  <path d="M -16 18 Q -22 27 -20 33" stroke="#A04A2A" stroke-width="3" fill="none" stroke-linecap="round" />
+  <path d="M 16 18 Q 22 27 20 33" stroke="#A04A2A" stroke-width="3" fill="none" stroke-linecap="round" />
+  <circle cx="0" cy="0" r="22" fill="#D97757" stroke="#A04A2A" stroke-width="2.2" />
+  <ellipse cx="-6" cy="-7" rx="6" ry="4" fill="white" opacity="0.32" />
+  <circle cx="-8" cy="-2" r="5" fill="white" />
+  <circle cx="8" cy="-2" r="5" fill="white" />
+  <circle cx="-8" cy="-2" r="2.6" fill="#1A0A05" />
+  <circle cx="8" cy="-2" r="2.6" fill="#1A0A05" />
+  <circle cx="-7" cy="-3" r="0.9" fill="white" />
+  <circle cx="9" cy="-3" r="0.9" fill="white" />
+  <path d="M -4 8 Q 0 11 4 8" stroke="#5C2410" stroke-width="1.8" fill="none" stroke-linecap="round" />
+</svg>

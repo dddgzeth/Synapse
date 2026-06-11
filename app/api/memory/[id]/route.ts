@@ -5,6 +5,8 @@
  */
 import { NextResponse } from "next/server";
 import { queryL1ByIds, queryL0ByIds } from "@/lib/memory/store";
+import { getCurrentUserId } from "@/lib/auth-session";
+import { sessionKeyForUser } from "@/lib/memory/user-scope";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -13,9 +15,11 @@ export async function GET(
   _req: Request,
   { params }: { params: { id: string } },
 ) {
+  const userId = await getCurrentUserId();
+  if (!userId) return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   const id = decodeURIComponent(params.id);
   const [memory] = queryL1ByIds([id]);
-  if (!memory) {
+  if (!memory || memory.sessionKey !== sessionKeyForUser(userId)) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   }
   const l0Rows = queryL0ByIds(memory.source_message_ids ?? []);

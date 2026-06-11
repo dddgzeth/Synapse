@@ -11,7 +11,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "node:crypto";
 import { forceFlush } from "@/lib/memory/scheduler";
-import { getCurrentSessionKey } from "@/lib/auth-session";
+import { getCurrentSessionKey, getCurrentUserId } from "@/lib/auth-session";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -24,9 +24,11 @@ export async function POST(req: NextRequest) {
   } catch {
     // empty body OK
   }
-  const sessionKey = await getCurrentSessionKey(body.sessionKey ?? "chat_main");
+  const userId = await getCurrentUserId();
+  if (!userId) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const sessionKey = await getCurrentSessionKey(body.sessionKey ?? null);
   if (!sessionKey) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const sessionId = body.sessionId ?? `flush_${crypto.randomBytes(3).toString("hex")}`;
-  const result = await forceFlush(sessionKey, sessionId);
+  const result = await forceFlush(sessionKey, sessionId, userId);
   return NextResponse.json(result);
 }

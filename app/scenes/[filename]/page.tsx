@@ -7,6 +7,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useI18n } from "@/components/i18n";
 
 interface ScenePayload {
@@ -62,7 +63,7 @@ export default function SceneDetailPage() {
       <article style={card} className="prose">
         {loading && <p style={{ color: "var(--text-muted)" }}>{t.common.loading}</p>}
         {error && <p style={{ color: "#a01010" }}>{t.common.loadFailed}: {error}</p>}
-        {scene && <ReactMarkdown>{scene.content}</ReactMarkdown>}
+        {scene && <ReactMarkdown remarkPlugins={[remarkGfm]}>{scene.content}</ReactMarkdown>}
       </article>
     </main>
   );

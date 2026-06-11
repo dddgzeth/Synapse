@@ -4,6 +4,7 @@ import Image from "next/image";
 import { FormEvent, useState } from "react";
 import { signIn, useSession } from "next-auth/react";
 import { useRouter, useSearchParams } from "next/navigation";
+import { SynnyMascot } from "./synny-mascot";
 
 // Email login has 3 steps:
 //   "email"    — collect email, check if registered
@@ -90,7 +91,7 @@ function StaticPreview() {
               padding: "5px 10px", background: "#f5f0e8", borderRadius: 8,
               fontSize: 12, color: "#555",
             }}>
-              <span>📁</span><span>NTU_Research_FAIR</span>
+              <span>📁</span><span>Research_Papers</span>
             </div>
             <div style={{ flex: 1 }} />
             <div style={{
@@ -258,7 +259,7 @@ export function LoginPanel() {
             alt="Synapse"
             width={160}
             height={40}
-            style={{ objectFit: "contain", objectPosition: "left" }}
+            style={{ objectFit: "contain", objectPosition: "left", mixBlendMode: "multiply" }}
           />
         </div>
 
@@ -407,7 +408,24 @@ export function LoginPanel() {
         alignItems: "center",
         justifyContent: "center",
         background: "linear-gradient(135deg, #ede8df 0%, #e8e0d4 100%)",
+        flexDirection: "column",
+        gap: 4,
       }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, marginTop: -8 }}>
+          <SynnyMascot size={92} />
+          <div style={{
+            background: "rgba(255,255,255,0.82)",
+            border: "1px solid rgba(0,0,0,0.06)",
+            borderRadius: "14px 14px 14px 2px",
+            padding: "10px 16px",
+            fontSize: 14,
+            fontWeight: 600,
+            color: "#4C1D95",
+            boxShadow: "0 4px 16px rgba(0,0,0,0.05)",
+          }}>
+            Hi, I&apos;m Synny — I&apos;ll remember it all for you.
+          </div>
+        </div>
         <StaticPreview />
       </div>
     </div>

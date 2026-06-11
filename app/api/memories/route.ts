@@ -1,28 +1,34 @@
 /**
- * /api/memories — sidebar data feed.
+ * /api/memories — sidebar data feed (per-user).
  *
  * Returns:
- *   - l0Count / l1Count           — raw counts
- *   - persona                     — L3 persona.md body (nav stripped)
- *   - scenes                      — L2 scene blocks (data/scene_blocks/*.md)
- *                                   with META + full content for expand-on-click
- *   - recentMemories              — L1 records (for the "最近记忆" list)
+ *   - l0Count / l1Count           — counts scoped to the signed-in user
+ *   - persona                     — L3 persona.md for this user
+ *   - scenes                      — L2 scene blocks for this user
+ *   - recentMemories              — L1 records for this user
  */
 
 import { NextResponse } from "next/server";
 import path from "node:path";
 import fs from "node:fs";
-import { queryAllL1, countL1, countL0 } from "@/lib/memory/store";
+import {
+  queryAllL1ForUser,
+  countL1ForUser,
+  countL0ForUser,
+} from "@/lib/memory/store";
 import { readSceneIndex } from "@/lib/tencentdb/scene/scene-index";
 import { parseSceneBlock } from "@/lib/tencentdb/scene/scene-format";
 import { stripSceneNavigation } from "@/lib/tencentdb/scene/scene-navigation";
+import { getCurrentUserId } from "@/lib/auth-session";
+import {
+  getUserDataDir,
+  getUserPersonaPath,
+  getUserSceneBlocksDir,
+  sessionKeyForUser,
+} from "@/lib/memory/user-scope";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-function getDataDir(): string {
-  return process.env.TDAI_DATA_DIR ?? path.join(process.cwd(), "data");
-}
 
 interface SceneBlockPayload {
   filename: string;
@@ -33,9 +39,9 @@ interface SceneBlockPayload {
   content: string;
 }
 
-async function readScenes(): Promise<SceneBlockPayload[]> {
-  const dataDir = getDataDir();
-  const blocksDir = path.join(dataDir, "scene_blocks");
+async function readScenes(userId: string): Promise<SceneBlockPayload[]> {
+  const dataDir = getUserDataDir(userId);
+  const blocksDir = getUserSceneBlocksDir(userId);
   try {
     const index = await readSceneIndex(dataDir);
     const scenes: SceneBlockPayload[] = [];
@@ -55,7 +61,6 @@ async function readScenes(): Promise<SceneBlockPayload[]> {
         // skip missing/unreadable file
       }
     }
-    // newest first
     scenes.sort((a, b) => (b.updated || "").localeCompare(a.updated || ""));
     return scenes;
   } catch {
@@ -63,8 +68,8 @@ async function readScenes(): Promise<SceneBlockPayload[]> {
   }
 }
 
-function readPersona(): string | null {
-  const personaPath = path.join(getDataDir(), "persona.md");
+function readPersona(userId: string): string | null {
+  const personaPath = getUserPersonaPath(userId);
   try {
     if (!fs.existsSync(personaPath)) return null;
     const raw = fs.readFileSync(personaPath, "utf-8");
@@ -76,12 +81,20 @@ function readPersona(): string | null {
 }
 
 export async function GET() {
-  const memories = queryAllL1(100);
-  const l1Count = countL1();
-  const l0Count = countL0();
+  const userId = await getCurrentUserId();
+  if (!userId) {
+    return NextResponse.json({
+      l0Count: 0, l1Count: 0, persona: null, scenes: [], recentMemories: [],
+    });
+  }
+  const userPrefix = sessionKeyForUser(userId);
+  // L1 memory is user-global (spans every session for this user).
+  const memories = queryAllL1ForUser(userPrefix, 100);
+  const l1Count = countL1ForUser(userPrefix);
+  const l0Count = countL0ForUser(userPrefix);
   const [scenes, persona] = await Promise.all([
-    readScenes(),
-    Promise.resolve(readPersona()),
+    readScenes(userId),
+    Promise.resolve(readPersona(userId)),
   ]);
 
   return NextResponse.json({

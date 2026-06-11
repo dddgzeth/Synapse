@@ -68,7 +68,7 @@ export function buildSyncedFileTools(
         "List files in the user's connected local folders (metadata only: " +
         "path, kind, size, modified time). \n\n" +
         "**IMPORTANT — pass `path_prefix` whenever the user mentions a sub-path** " +
-        "(e.g. user says 'analyze Zotero/NTU/SDL', pass `path_prefix='Zotero/NTU/SDL'`). " +
+        "(e.g. user says 'analyze Zotero/Papers', pass `path_prefix='Zotero/Papers'`). " +
         "Without a prefix this can return hundreds of files and burn tokens.\n\n" +
         "Call this ONCE per scope at the start of a conversation; the result is " +
         "stable for the rest of this conversation. DO NOT re-call before each " +
@@ -79,7 +79,7 @@ export function buildSyncedFileTools(
           .optional()
           .describe(
             "Optional case-sensitive path prefix filter, e.g. " +
-            "'NTU_Research_FAIR/Zotero/NTU/SDL'. Matches files whose path " +
+            "'Research_Papers/Zotero/Papers'. Matches files whose path " +
             "starts with this string. Omit to get all synced files.",
           ),
       }),

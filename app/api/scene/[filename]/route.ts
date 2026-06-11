@@ -8,25 +8,27 @@ import path from "node:path";
 import fs from "node:fs";
 import { parseSceneBlock } from "@/lib/tencentdb/scene/scene-format";
 import { readSceneIndex } from "@/lib/tencentdb/scene/scene-index";
+import { getCurrentUserId } from "@/lib/auth-session";
+import { getUserDataDir, getUserSceneBlocksDir } from "@/lib/memory/user-scope";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-function getDataDir(): string {
-  return process.env.TDAI_DATA_DIR ?? path.join(process.cwd(), "data");
-}
 
 export async function GET(
   _req: Request,
   { params }: { params: { filename: string } },
 ) {
+  const userId = await getCurrentUserId();
+  if (!userId) {
+    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
+  }
   const filename = decodeURIComponent(params.filename);
   // Defence-in-depth: reject path traversal.
   if (filename.includes("/") || filename.includes("..")) {
     return NextResponse.json({ error: "invalid_filename" }, { status: 400 });
   }
-  const dataDir = getDataDir();
-  const filePath = path.join(dataDir, "scene_blocks", filename);
+  const dataDir = getUserDataDir(userId);
+  const filePath = path.join(getUserSceneBlocksDir(userId), filename);
   if (!fs.existsSync(filePath)) {
     return NextResponse.json({ error: "not_found" }, { status: 404 });
   }

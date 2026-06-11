@@ -4,11 +4,14 @@
  */
 import { NextResponse } from "next/server";
 import { markAhaLastSeen } from "@/lib/memory/aha";
+import { getCurrentUserId } from "@/lib/auth-session";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 export async function POST() {
-  markAhaLastSeen();
+  const userId = await getCurrentUserId();
+  if (!userId) return NextResponse.json({ ok: false }, { status: 401 });
+  markAhaLastSeen(userId);
   return NextResponse.json({ ok: true });
 }

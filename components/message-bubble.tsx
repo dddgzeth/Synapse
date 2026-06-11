@@ -1,16 +1,36 @@
 "use client";
 
 import ReactMarkdown from "react-markdown";
-import { useState } from "react";
+import remarkGfm from "remark-gfm";
+import { useEffect, useRef, useState } from "react";
 import type { UIMessage } from "ai";
 import { EvidenceGraph, type AhaPayload, type EvidenceData, type SelectedDetail } from "./evidence-graph";
 import { EvidenceDrawer } from "./evidence-drawer";
-import { useI18n, type TranslationSet } from "./i18n";
+import { useI18n, type TranslationSet, getApiSettingsForRequest } from "./i18n";
+import { MessagePageView } from "./message-page-view";
+import { parsePageArtifact } from "@/lib/page-artifact";
 
 interface Props {
   message: UIMessage;
   /** Whether the chat is currently streaming this message in. */
   streaming?: boolean;
+}
+
+/**
+ * LLM output often jams an ATX heading onto the line right after a list item or
+ * paragraph with no blank line — CommonMark then treats the `##` line as a
+ * continuation of the previous block, so the user sees literal `##`. Same for
+ * fenced code blocks and tables that come right after a heading. Insert the
+ * missing blank lines so react-markdown can do its job.
+ */
+function normalizeMarkdown(raw: string): string {
+  return raw
+    // blank line BEFORE any ATX heading that's not already at the start
+    .replace(/([^\n])\n(#{1,6} )/g, "$1\n\n$2")
+    // blank line AFTER an ATX heading line
+    .replace(/(\n#{1,6} [^\n]*)\n(?!\n|#{1,6} )/g, "$1\n\n")
+    // blank line before fenced code that follows immediately after text
+    .replace(/([^\n])\n(```)/g, "$1\n\n$2");
 }
 
 function extractText(message: UIMessage): string {
@@ -337,13 +357,90 @@ function formatChars(n: number, t: TranslationSet): string {
 }
 
 export function MessageBubble({ message, streaming = false }: Props) {
+  const { t, apiSettings } = useI18n();
   const isUser = message.role === "user";
+  const [viewMode, setViewMode] = useState<"chat" | "page">("chat");
   const fullText = extractText(message);
+  // Artifact protocol is assistant-only output. Skipping it for user messages
+  // means we can never accidentally strip part of a user's question because it
+  // contained one of the marker substrings.
+  const { visibleText, html: pageHtml } = isUser
+    ? { visibleText: fullText, html: null as string | null }
+    : parsePageArtifact(fullText);
   const images = isUser ? extractImages(message) : [];
-  const { mainContent, ahaInsight } = parseAha(fullText);
+  const { mainContent, ahaInsight } = parseAha(visibleText);
   const hasText = mainContent.replace(/\s/g, "").length > 0;
+  const hasInlineArtifact = !!pageHtml?.trim();  // legacy: pre-lazy reply with embedded artifact
   const progress = isUser ? [] : extractProgress(message);
   const clientTools = isUser ? [] : extractClientToolParts(message);
+
+  // Lazy-loaded page artifact. Pages used to be eagerly generated alongside
+  // every reply, doubling token cost even when the user never opened Page
+  // view. Now it's opt-in: only fetched when the user clicks the Page toggle,
+  // and cached in localStorage so a refresh doesn't re-generate.
+  const cacheKey = `synapse:page:${message.id}`;
+  const [lazyHtml, setLazyHtml] = useState<string | null>(() => {
+    if (typeof window === "undefined" || isUser) return null;
+    try { return window.localStorage.getItem(cacheKey); } catch { return null; }
+  });
+  const [pageLoading, setPageLoading] = useState(false);
+  const [pageError, setPageError] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
+
+  // The HTML we actually feed to the iframe: inline artifact wins (legacy
+  // messages), otherwise lazy-fetched HTML.
+  const activePageHtml = hasInlineArtifact ? pageHtml : lazyHtml;
+
+  async function fetchPageRender() {
+    if (inFlightRef.current || isUser) return;
+    const baseText = mainContent.trim();
+    if (!baseText) {
+      setPageError(t.chat.viewPageEmpty);
+      return;
+    }
+    inFlightRef.current = true;
+    setPageLoading(true);
+    setPageError(null);
+    try {
+      const resp = await fetch("/api/page-render", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          assistantText: baseText,
+          apiSettings: getApiSettingsForRequest(apiSettings),
+        }),
+      });
+      if (!resp.ok) {
+        const txt = await resp.text().catch(() => `HTTP ${resp.status}`);
+        setPageError(txt.slice(0, 200));
+        return;
+      }
+      const data = await resp.json() as { html?: string; error?: string };
+      if (data.error) {
+        setPageError(data.error);
+        return;
+      }
+      const html = (data.html ?? "").trim();
+      if (!html) {
+        setPageError(t.chat.viewPageEmpty);
+        return;
+      }
+      setLazyHtml(html);
+      try { window.localStorage.setItem(cacheKey, html); } catch { /* quota / disabled */ }
+    } catch (e) {
+      setPageError(e instanceof Error ? e.message : String(e));
+    } finally {
+      inFlightRef.current = false;
+      setPageLoading(false);
+    }
+  }
+
+  function handleToggle(mode: "chat" | "page") {
+    setViewMode(mode);
+    if (mode === "page" && !activePageHtml && !pageLoading && !isUser) {
+      fetchPageRender();
+    }
+  }
 
   return (
     <div style={{
@@ -364,7 +461,14 @@ export function MessageBubble({ message, streaming = false }: Props) {
         </div>
       )}
 
-      <div style={{ maxWidth: "80%", display: "flex", flexDirection: "column", gap: 6, alignItems: isUser ? "flex-end" : "flex-start" }}>
+      <div style={{
+        maxWidth: !isUser && viewMode === "page" ? "min(92vw, 960px)" : "80%",
+        width: !isUser && viewMode === "page" ? "min(92vw, 960px)" : undefined,
+        display: "flex",
+        flexDirection: "column",
+        gap: 6,
+        alignItems: isUser ? "flex-end" : "flex-start",
+      }}>
         {/* Tool-call progress (Synapse only) */}
         {!isUser && (progress.length > 0 || clientTools.length > 0 || streaming) && (
           <ProgressChips items={progress} clientTools={clientTools} streaming={streaming && !hasText} />
@@ -389,25 +493,73 @@ export function MessageBubble({ message, streaming = false }: Props) {
         )}
 
         {/* Message text */}
-        {hasText && (
-          <div style={{
-            padding: "10px 14px",
-            background: isUser ? "var(--accent)" : "var(--surface)",
-            border: isUser ? "none" : "1px solid var(--border)",
-            borderRadius: isUser ? "14px 14px 4px 14px" : "4px 14px 14px 14px",
-            color: isUser ? "#fff" : "var(--text)",
-            fontSize: 14,
-            lineHeight: 1.65,
-            boxShadow: isUser ? "none" : "0 1px 3px rgba(0,0,0,0.06)",
-          }}>
-            {isUser ? (
-              <span style={{ whiteSpace: "pre-wrap" }}>{mainContent}</span>
-            ) : (
-              <div className="prose">
-                <ReactMarkdown>{mainContent}</ReactMarkdown>
+        {(hasText || (!isUser && hasInlineArtifact)) && (
+          <>
+            {!isUser && (
+              <div style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 2,
+                padding: 3,
+                border: "1px solid var(--border)",
+                borderRadius: 8,
+                background: "var(--surface)",
+                boxShadow: "0 1px 2px rgba(0,0,0,0.04)",
+              }}>
+                {(["chat", "page"] as const).map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => handleToggle(mode)}
+                    aria-pressed={viewMode === mode}
+                    title={mode === "chat" ? t.chat.viewChatTitle : t.chat.viewPageTitle}
+                    style={{
+                      border: "none",
+                      borderRadius: 6,
+                      padding: "4px 9px",
+                      background: viewMode === mode ? "var(--accent)" : "transparent",
+                      color: viewMode === mode ? "#fff" : "var(--text-muted)",
+                      cursor: "pointer",
+                      fontSize: 12,
+                      fontWeight: 700,
+                      lineHeight: 1.2,
+                      fontFamily: "inherit",
+                    }}
+                  >
+                    {mode === "chat" ? t.chat.viewChat : t.chat.viewPage}
+                  </button>
+                ))}
               </div>
             )}
-          </div>
+            {viewMode === "page" && !isUser ? (
+              pageLoading
+                ? <PagePlaceholder kind="loading" label={t.chat.viewPageLoading} onRetry={null} />
+                : pageError
+                  ? <PagePlaceholder kind="error" label={pageError} onRetry={fetchPageRender} />
+                  : activePageHtml
+                    ? <MessagePageView text={mainContent} htmlArtifact={activePageHtml} />
+                    : <PagePlaceholder kind="loading" label={t.chat.viewPageLoading} onRetry={null} />
+            ) : (
+              hasText ? <div style={{
+                padding: "10px 14px",
+                background: isUser ? "var(--accent)" : "var(--surface)",
+                border: isUser ? "none" : "1px solid var(--border)",
+                borderRadius: isUser ? "14px 14px 4px 14px" : "4px 14px 14px 14px",
+                color: isUser ? "#fff" : "var(--text)",
+                fontSize: 14,
+                lineHeight: 1.65,
+                boxShadow: isUser ? "none" : "0 1px 3px rgba(0,0,0,0.06)",
+              }}>
+                {isUser ? (
+                  <UserMessageContent text={mainContent} />
+                ) : (
+                  <div className="prose">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{normalizeMarkdown(mainContent)}</ReactMarkdown>
+                  </div>
+                )}
+              </div> : null
+            )}
+          </>
         )}
 
         {ahaInsight && <AhaCard content={ahaInsight} />}
@@ -537,4 +689,180 @@ function parseAha(content: string): { mainContent: string; ahaInsight: string | 
   const afterMarker = content.slice(markerIdx + 5).trim();
   if (!afterMarker.includes("Synapse 注意到")) return { mainContent: content, ahaInsight: null };
   return { mainContent: content.slice(0, markerIdx).trim(), ahaInsight: afterMarker };
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// User-message attachment rendering
+//
+// chat-panel.tsx wraps attached files into the user's text as:
+//   <<<file: NAME>>>\nCONTENT\n<<<end: NAME>>>
+// The LLM sees the inlined content, but the human user shouldn't have a wall
+// of extracted text in their own bubble. Detect those blocks at render time
+// and replace them with collapsible 📎 chips.
+//
+// Works for every format chat-panel client-parses (txt, md, pdf, docx, pptx,
+// xlsx, etc.) since the wrapping format is uniform — no per-format logic
+// needed here.
+// ─────────────────────────────────────────────────────────────────────────
+
+interface InlinedAttachment {
+  name: string;
+  content: string;
+}
+
+function parseUserMessageAttachments(text: string): {
+  textWithoutFiles: string;
+  attachments: InlinedAttachment[];
+} {
+  // Match `<<<file: NAME>>>\nCONTENT\n<<<end: ...>>>`. Use a non-greedy body
+  // and accept any closing name (chat-panel always echoes the same name back,
+  // but accepting any is more robust to whitespace drift).
+  const re = /<<<file:\s*([^\n>]+?)>>>\r?\n([\s\S]*?)\r?\n<<<end:\s*[^\n>]+?>>>/g;
+  const attachments: InlinedAttachment[] = [];
+  const cleaned = text.replace(re, (_, name, content) => {
+    attachments.push({
+      name: String(name).trim(),
+      content: String(content).trim(),
+    });
+    return "";  // strip the block from the displayed text
+  });
+  return {
+    textWithoutFiles: cleaned.replace(/\n{3,}/g, "\n\n").trim(),
+    attachments,
+  };
+}
+
+function UserMessageContent({ text }: { text: string }) {
+  const { textWithoutFiles, attachments } = parseUserMessageAttachments(text);
+  return (
+    <>
+      {attachments.length > 0 && (
+        <div style={{
+          display: "flex", flexDirection: "column", gap: 6,
+          marginBottom: textWithoutFiles ? 10 : 0,
+        }}>
+          {attachments.map((a, i) => (
+            <AttachmentChip key={`${a.name}_${i}`} name={a.name} content={a.content} />
+          ))}
+        </div>
+      )}
+      {textWithoutFiles && (
+        <span style={{ whiteSpace: "pre-wrap" }}>{textWithoutFiles}</span>
+      )}
+    </>
+  );
+}
+
+function fileIcon(name: string): string {
+  const lower = name.toLowerCase();
+  if (/\.(pdf)$/.test(lower))                return "📄";
+  if (/\.(pptx?|key)$/.test(lower))          return "📊";
+  if (/\.(docx?|rtf|odt)$/.test(lower))      return "📝";
+  if (/\.(xlsx?|csv|ods|tsv)$/.test(lower))  return "📈";
+  if (/\.(json|yaml|yml|toml|xml)$/.test(lower)) return "🗂️";
+  if (/\.(md|tex|rst|txt)$/.test(lower))     return "📃";
+  return "📎";
+}
+
+function formatCharCount(n: number): string {
+  if (n < 1000) return `${n} chars`;
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k chars`;
+  return `${(n / 1_000_000).toFixed(2)}M chars`;
+}
+
+function AttachmentChip({ name, content }: InlinedAttachment) {
+  const [expanded, setExpanded] = useState(false);
+  // Bubble background is var(--accent) — make the chip a translucent overlay
+  // so it reads cleanly on top while staying clearly "inside" the user message.
+  return (
+    <div
+      style={{
+        background: "rgba(255,255,255,0.16)",
+        border: "1px solid rgba(255,255,255,0.25)",
+        borderRadius: 10,
+        overflow: "hidden",
+        fontSize: 12,
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setExpanded((v) => !v)}
+        style={{
+          display: "flex", alignItems: "center", gap: 8,
+          width: "100%", padding: "6px 10px",
+          background: "none", border: "none", cursor: "pointer",
+          color: "inherit", fontFamily: "inherit", fontSize: 12,
+          textAlign: "left",
+        }}
+      >
+        <span style={{ fontSize: 14, flexShrink: 0 }}>{fileIcon(name)}</span>
+        <span style={{
+          flex: 1, fontWeight: 600,
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+        }}>{name}</span>
+        <span style={{ opacity: 0.75, fontSize: 11, flexShrink: 0 }}>
+          {formatCharCount(content.length)}
+        </span>
+        <span style={{ opacity: 0.6, fontSize: 10, flexShrink: 0 }}>
+          {expanded ? "▾" : "▸"}
+        </span>
+      </button>
+      {expanded && (
+        <pre style={{
+          margin: 0,
+          padding: "8px 10px",
+          background: "rgba(0,0,0,0.18)",
+          maxHeight: 280, overflow: "auto",
+          fontSize: 11, lineHeight: 1.5,
+          whiteSpace: "pre-wrap", wordBreak: "break-word",
+          fontFamily: "ui-monospace, SFMono-Regular, monospace",
+        }}>{content}</pre>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Lazy Page render placeholders — shown while /api/page-render is in flight
+// or after it errored. Width matches the inline iframe so the layout doesn't
+// shift when the real page arrives.
+// ─────────────────────────────────────────────────────────────────────────
+
+function PagePlaceholder({
+  kind, label, onRetry,
+}: { kind: "loading" | "error"; label: string; onRetry: (() => void) | null }) {
+  const { t } = useI18n();
+  const isErr = kind === "error";
+  return (
+    <div style={{
+      width: "100%",
+      alignSelf: "stretch",
+      padding: "32px 24px",
+      border: isErr ? "1px solid #F0B8B8" : "1px solid var(--border)",
+      borderRadius: 12,
+      background: isErr ? "#FFF7F7" : "var(--surface)",
+      fontSize: 13,
+      color: isErr ? "#7A1010" : "var(--text-muted)",
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      justifyContent: "center",
+      gap: 10,
+      minHeight: 120,
+    }}>
+      <span>{isErr ? "⚠️" : "🛠️"} {label}</span>
+      {onRetry && (
+        <button
+          onClick={onRetry}
+          style={{
+            padding: "4px 12px", borderRadius: 8,
+            border: "1px solid var(--border)", background: "var(--surface-2)",
+            cursor: "pointer", fontSize: 12, color: "var(--text)",
+          }}
+        >
+          {t.chat.viewPageRetry}
+        </button>
+      )}
+    </div>
+  );
 }

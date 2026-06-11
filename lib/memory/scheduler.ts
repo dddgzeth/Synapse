@@ -78,14 +78,14 @@ export interface NotifyResult {
  * Increments turn count; fires L1 batch only when threshold met.
  * Async but safe to fire-and-forget (or await for tests).
  */
-export async function notifyTurn(sessionKey: string, sessionId: string): Promise<NotifyResult> {
+export async function notifyTurn(sessionKey: string, sessionId: string, userId: string): Promise<NotifyResult> {
   const next = getTurnCount(sessionKey) + 1;
   setTurnCount(sessionKey, next);
   if (next < TURNS_PER_L1) {
     return { triggeredL1: false, newMemories: 0, triggeredL2: false };
   }
   console.log(`${TAG} [${sessionKey}] turn threshold reached (${next}/${TURNS_PER_L1}) → firing L1`);
-  return runL1AndMaybeL2(sessionKey, sessionId);
+  return runL1AndMaybeL2(sessionKey, sessionId, userId);
 }
 
 /**
@@ -93,27 +93,27 @@ export async function notifyTurn(sessionKey: string, sessionId: string): Promise
  * process. Used when the user returns to chat after a gap — the SynapseApp
  * mount calls this so any leftover turns get digested.
  */
-export async function forceFlush(sessionKey: string, sessionId: string): Promise<NotifyResult> {
+export async function forceFlush(sessionKey: string, sessionId: string, userId: string): Promise<NotifyResult> {
   const pending = getTurnCount(sessionKey);
   if (pending === 0) {
     return { triggeredL1: false, newMemories: 0, triggeredL2: false };
   }
   console.log(`${TAG} [${sessionKey}] forceFlush with ${pending} pending turn(s) → firing L1`);
-  return runL1AndMaybeL2(sessionKey, sessionId);
+  return runL1AndMaybeL2(sessionKey, sessionId, userId);
 }
 
 // ─────────────────────────────────────
 // Internals
 // ─────────────────────────────────────
 
-async function runL1AndMaybeL2(sessionKey: string, sessionId: string): Promise<NotifyResult> {
+async function runL1AndMaybeL2(sessionKey: string, sessionId: string, userId: string): Promise<NotifyResult> {
   // Always reset the turn counter BEFORE awaiting L1 to prevent two concurrent
   // notifies from both crossing the threshold and double-firing.
   setTurnCount(sessionKey, 0);
 
   let l1Out: L1RunResult;
   try {
-    l1Out = await runL1Pipeline(sessionKey, sessionId);
+    l1Out = await runL1Pipeline(sessionKey, sessionId, userId);
   } catch (err) {
     console.error(`${TAG} [${sessionKey}] L1 pipeline threw:`, err);
     return { triggeredL1: true, newMemories: 0, triggeredL2: false };
@@ -132,7 +132,7 @@ async function runL1AndMaybeL2(sessionKey: string, sessionId: string): Promise<N
   }
 
   // Threshold met → queue L2 with mutex protection.
-  const queued = maybeRunL2(sessionKey, l1Out.newMemoryRecords);
+  const queued = maybeRunL2(sessionKey, userId, l1Out.newMemoryRecords);
   return { triggeredL1: true, newMemories: newCount, triggeredL2: queued };
 }
 
@@ -141,7 +141,7 @@ async function runL1AndMaybeL2(sessionKey: string, sessionId: string): Promise<N
  * mark dirty so we re-fire once it finishes — protects scene_blocks/*.md from
  * concurrent writes by two L2 agentic loops on the same session.
  */
-function maybeRunL2(sessionKey: string, newMemories: Array<{ id: string; content: string; createdAt: string }>): boolean {
+function maybeRunL2(sessionKey: string, userId: string, newMemories: Array<{ id: string; content: string; createdAt: string }>): boolean {
   if (l2Running.has(sessionKey)) {
     l2Dirty.add(sessionKey);
     console.log(`${TAG} [${sessionKey}] L2 already running → marked dirty`);
@@ -149,20 +149,21 @@ function maybeRunL2(sessionKey: string, newMemories: Array<{ id: string; content
   }
   l2Running.add(sessionKey);
   console.log(`${TAG} [${sessionKey}] L2 lock acquired → starting`);
-  void runL2WithDirtyCheck(sessionKey, newMemories);
+  void runL2WithDirtyCheck(sessionKey, userId, newMemories);
   return true;
 }
 
 async function runL2WithDirtyCheck(
   sessionKey: string,
+  userId: string,
   newMemories: Array<{ id: string; content: string; createdAt: string }>,
 ): Promise<void> {
   try {
-    await runL2L3Pipeline({ newMemories });
+    await runL2L3Pipeline({ userId, newMemories });
     setMemsSinceL2(sessionKey, 0);
     // Aha detection piggy-backs on L2 completion — exact same trigger model
     // as before (just no longer fired from inside L1).
-    runAhaDetection().catch((err) => console.error(`${TAG} aha detection failed:`, err));
+    runAhaDetection(userId).catch((err) => console.error(`${TAG} aha detection failed:`, err));
   } catch (err) {
     console.error(`${TAG} [${sessionKey}] L2 pipeline threw:`, err);
   } finally {
@@ -175,10 +176,7 @@ async function runL2WithDirtyCheck(
       const accumulated = getMemsSinceL2(sessionKey);
       if (accumulated >= NEW_MEMS_PER_L2) {
         console.log(`${TAG} [${sessionKey}] re-firing L2 (dirty + ${accumulated} accumulated)`);
-        // No new-memories list to pass; use empty so L2L3 pipeline reads from store.
-        // (runL2L3Pipeline internally tolerates empty newMemories — scene
-        // extractor falls back to "all recent memories" logic.)
-        maybeRunL2(sessionKey, []);
+        maybeRunL2(sessionKey, userId, []);
       }
     }
   }

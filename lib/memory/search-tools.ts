@@ -12,10 +12,11 @@
 import { tool } from "ai";
 import { z } from "zod";
 import {
-  searchL0Fts,
-  searchL1Fts,
+  searchL0FtsForUser,
+  searchL1FtsForUser,
   type L0Message,
 } from "./store";
+import { sessionKeyForUser } from "./user-scope";
 import type { MemoryRecord } from "../tencentdb/record/l1-writer";
 
 const TAG_CONV = "[synapse][tdai_conversation_search]";
@@ -44,18 +45,21 @@ export interface ConversationSearchResult {
 export async function executeConversationSearch(params: {
   query: string;
   limit: number;
+  userId: string;
   sessionKey?: string;
 }): Promise<ConversationSearchResult> {
-  const { query, limit, sessionKey: sessionFilter } = params;
+  const { query, limit, userId, sessionKey: sessionFilter } = params;
   if (!query || query.trim().length === 0) {
     return { results: [], total: 0, strategy: "none" };
   }
-
-  // Over-retrieve so session filter still gives `limit` rows when possible.
+  // Hard scope: ONLY this user's sessions (default + children). Even if the
+  // LLM tries to pass a sessionFilter belonging to someone else, we never
+  // search outside the user's prefix.
+  const userPrefix = sessionKeyForUser(userId);
   const candidateK = sessionFilter ? limit * 4 : limit * 2;
   let rows: L0Message[] = [];
   try {
-    rows = searchL0Fts(query, candidateK);
+    rows = searchL0FtsForUser(query, userPrefix, candidateK);
   } catch (err) {
     console.warn(`${TAG_CONV} FTS failed:`, err);
     return { results: [], total: 0, strategy: "none" };
@@ -76,7 +80,10 @@ export async function executeConversationSearch(params: {
   }));
 
   if (sessionFilter) {
-    items = items.filter((i) => i.session_key === sessionFilter);
+    // Honor the LLM-requested filter only if it's within this user's prefix.
+    if (sessionFilter === userPrefix || sessionFilter.startsWith(`${userPrefix}_`)) {
+      items = items.filter((i) => i.session_key === sessionFilter);
+    }
   }
 
   const trimmed = items.slice(0, limit);
@@ -125,18 +132,22 @@ export interface MemorySearchResult {
 export async function executeMemorySearch(params: {
   query: string;
   limit: number;
+  userId: string;
   type?: string;
   scene?: string;
 }): Promise<MemorySearchResult> {
-  const { query, limit, type: typeFilter, scene: sceneFilter } = params;
+  const { query, limit, userId, type: typeFilter, scene: sceneFilter } = params;
   if (!query || query.trim().length === 0) {
     return { results: [], total: 0, strategy: "none" };
   }
-
+  // Hard scope to this user (ALL of their sessions — L1 is user-global).
+  // L1 records are tagged with session_key at write time, so the prefix
+  // filter prevents cross-user leaks while still spanning the user's chats.
+  const userPrefix = sessionKeyForUser(userId);
   const candidateK = (typeFilter || sceneFilter) ? limit * 4 : limit * 2;
   let rows: MemoryRecord[] = [];
   try {
-    rows = searchL1Fts(query, candidateK);
+    rows = searchL1FtsForUser(query, userPrefix, candidateK);
   } catch (err) {
     console.warn(`${TAG_MEM} FTS failed:`, err);
     return { results: [], total: 0, strategy: "none" };
@@ -196,22 +207,63 @@ export async function executeWebSearch(query: string): Promise<string> {
       body: JSON.stringify({
         api_key: apiKey,
         query,
-        search_depth: "basic",
-        max_results: 6,
+        search_depth: "advanced",
+        max_results: 8,
         include_answer: true,
+        include_raw_content: false,
       }),
-      signal: AbortSignal.timeout(15_000),
+      signal: AbortSignal.timeout(20_000),
     });
+    if (resp.status === 429) {
+      // Rate limited — wait 2s and retry once
+      await new Promise((r) => setTimeout(r, 2000));
+      const retry = await fetch("https://api.tavily.com/search", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ api_key: apiKey, query, search_depth: "basic", max_results: 6, include_answer: true }),
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!retry.ok) return `Search rate-limited. Try rephrasing or wait a moment.`;
+      const data2 = await retry.json();
+      return formatTavilyResult(data2);
+    }
     if (!resp.ok) return `Search failed: HTTP ${resp.status}`;
     const data = await resp.json();
-    const lines: string[] = [];
-    if (data.answer) lines.push(`**Summary:** ${data.answer}\n`);
-    for (const r of (data.results ?? []) as Array<{ title: string; url: string; content: string }>) {
-      lines.push(`**${r.title}**\n${r.url}\n${r.content?.slice(0, 300) ?? ""}`);
-    }
-    return lines.length > 0 ? lines.join("\n\n") : "No results found.";
+    return formatTavilyResult(data);
   } catch (err: any) {
     return `Search error: ${err?.message ?? String(err)}`;
+  }
+}
+
+function formatTavilyResult(data: any): string {
+  const lines: string[] = [];
+  if (data.answer) lines.push(`**Summary:** ${data.answer}\n`);
+  for (const r of (data.results ?? []) as Array<{ title: string; url: string; content: string }>) {
+    lines.push(`**${r.title}**\n${r.url}\n${r.content?.slice(0, 400) ?? ""}`);
+  }
+  return lines.length > 0 ? lines.join("\n\n") : "No results found. Try a broader or different query.";
+}
+
+export async function executeSemanticScholarSearch(query: string): Promise<string> {
+  try {
+    const url = `https://api.semanticscholar.org/graph/v1/paper/search?query=${encodeURIComponent(query)}&fields=title,authors,year,externalIds,openAccessPdf,tldr,publicationVenue&limit=5`;
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "Synapse/1.0" },
+      signal: AbortSignal.timeout(12_000),
+    });
+    if (!resp.ok) return `Semantic Scholar search failed: HTTP ${resp.status}`;
+    const data = await resp.json();
+    const papers = data.data ?? [];
+    if (papers.length === 0) return "No papers found on Semantic Scholar.";
+    return papers.map((p: any) => {
+      const authors = (p.authors ?? []).slice(0, 3).map((a: any) => a.name).join(", ");
+      const doi = p.externalIds?.DOI ? `DOI: ${p.externalIds.DOI}` : "";
+      const pdf = p.openAccessPdf?.url ? `PDF: ${p.openAccessPdf.url}` : "";
+      const tldr = p.tldr?.text ? `\nTL;DR: ${p.tldr.text}` : "";
+      return `**${p.title}** (${p.year ?? "?"})\n${authors}\n${doi}${doi && pdf ? " | " : ""}${pdf}${tldr}`;
+    }).join("\n\n");
+  } catch (err: any) {
+    return `Semantic Scholar error: ${err?.message ?? String(err)}`;
   }
 }
 
@@ -249,7 +301,7 @@ export async function executeFetchUrl(url: string): Promise<string> {
  * Tool names match the TencentDB originals so existing system-prompt conventions
  * and downstream LLM training carry over.
  */
-export function buildChatTools() {
+export function buildChatTools(userId: string) {
   return {
     web_search: tool({
       description:
@@ -273,6 +325,17 @@ export function buildChatTools() {
       execute: async ({ url }) => executeFetchUrl(url),
     }),
 
+    search_papers: tool({
+      description:
+        "Search academic papers on Semantic Scholar. Returns title, authors, year, DOI, open-access PDF link, and TL;DR. " +
+        "Use when the user asks about research papers, wants to find a paper's DOI/PDF, or needs to find associated code repos. " +
+        "Better than web_search for academic queries. After finding a paper, use fetch_url on its DOI or GitHub link.",
+      inputSchema: z.object({
+        query: z.string().describe("Paper title, author name, or topic, e.g. 'MINERVA self-driving lab nanomaterials BAM'"),
+      }),
+      execute: async ({ query }) => executeSemanticScholarSearch(query),
+    }),
+
     tdai_conversation_search: tool({
       description:
         "Search the user's stored RAW CONVERSATION history (L0) by keywords. " +
@@ -292,6 +355,7 @@ export function buildChatTools() {
         const res = await executeConversationSearch({
           query,
           limit: limit ?? 8,
+          userId,
           sessionKey,
         });
         return formatConversationSearchResponse(res);
@@ -321,6 +385,7 @@ export function buildChatTools() {
         const res = await executeMemorySearch({
           query,
           limit: limit ?? 8,
+          userId,
           type,
           scene,
         });

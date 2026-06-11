@@ -1,36 +1,50 @@
 /**
- * Memory recall — retrieve relevant L1 memories + L3 persona before each chat turn.
- * Adapted from TencentDB auto-recall.ts.
+ * Memory recall — retrieve relevant L1 memories + L3 persona + connection /
+ * contradiction analysis before each chat turn.
+ *
+ * Pipeline:
+ *   user message
+ *     ├─ persona.md (always)
+ *     ├─ FTS-recalled L1 memories (lexical match, user-scoped)
+ *     └─ context-analyzer: classifies FTS hits into connection / contradiction
+ *
+ * The analyzer is what turns Connection-Suggester and Contradiction-Finder
+ * from "two more LLM features" into a single typed-relationship layer on top
+ * of recall. The main chat LLM sees structured links and decides organically
+ * when to weave them in.
+ *
+ * Returns synchronously-formatted context for direct system prompt injection.
+ * Async because of the analyzer call.
  */
 
-import path from "node:path";
 import fs from "node:fs";
-import { searchL1Fts } from "./store";
+import { searchL1FtsForUser } from "./store";
+import { getUserPersonaPath, sessionKeyForUser } from "./user-scope";
+import { analyzeRecallContext, formatLinksForPrompt, type MemoryLink } from "./insights/context-analyzer";
 import type { MemoryRecord } from "../tencentdb/record/l1-writer";
 
 const TOP_K = 8;
 
-// ============================
-// Recall result
-// ============================
-
 export interface RecallResult {
   memories: MemoryRecord[];
   persona: string | null;
+  links: MemoryLink[];
   contextText: string; // formatted for LLM system prompt injection
 }
 
-// ============================
-// Main recall function
-// ============================
+export async function recallForQuery(userText: string, userId: string): Promise<RecallResult> {
+  const userPrefix = sessionKeyForUser(userId);
 
-export function recallForQuery(userText: string): RecallResult {
-  const memories = searchL1Fts(userText, TOP_K);
+  // L1 memory is user-global: search across ALL of this user's sessions.
+  const memories = searchL1FtsForUser(userText, userPrefix, TOP_K);
 
-  const dataDir = process.env.TDAI_DATA_DIR ?? path.join(process.cwd(), "data");
-  const personaPath = path.join(dataDir, "persona.md");
+  // Persona — always injected if it exists, independent of FTS match. This is
+  // what made the bug "no record of your research direction" so bad: persona
+  // was being skipped because of a wrong userId path. The fix is structural:
+  // persona doesn't need to "match" anything; it IS the always-on profile.
   let persona: string | null = null;
   try {
+    const personaPath = getUserPersonaPath(userId);
     if (fs.existsSync(personaPath)) {
       persona = fs.readFileSync(personaPath, "utf-8").trim() || null;
     }
@@ -38,15 +52,19 @@ export function recallForQuery(userText: string): RecallResult {
     // persona not yet generated
   }
 
-  const contextText = formatRecallContext(memories, persona);
-  return { memories, persona, contextText };
+  // Semantic classification of the recalled memories — separated from FTS so
+  // the spam-control logic (bias to skip) lives in one place.
+  const links = await analyzeRecallContext(userText, memories);
+
+  const contextText = formatRecallContext(memories, persona, links);
+  return { memories, persona, links, contextText };
 }
 
-// ============================
-// Format for system prompt
-// ============================
-
-function formatRecallContext(memories: MemoryRecord[], persona: string | null): string {
+function formatRecallContext(
+  memories: MemoryRecord[],
+  persona: string | null,
+  links: MemoryLink[],
+): string {
   const parts: string[] = [];
 
   if (persona) {
@@ -60,6 +78,9 @@ function formatRecallContext(memories: MemoryRecord[], persona: string | null): 
       .join("\n");
     parts.push(`<relevant-research-memories>\n${memLines}\n</relevant-research-memories>`);
   }
+
+  const linksBlock = formatLinksForPrompt(links);
+  if (linksBlock) parts.push(linksBlock);
 
   return parts.join("\n\n");
 }

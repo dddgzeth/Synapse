@@ -6,6 +6,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useI18n } from "@/components/i18n";
 
 export default function PersonaPage() {
@@ -36,7 +37,7 @@ export default function PersonaPage() {
             {t.details.personaEmpty}
           </p>
         )}
-        {!loading && text && <ReactMarkdown>{text}</ReactMarkdown>}
+        {!loading && text && <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>}
       </article>
     </main>
   );

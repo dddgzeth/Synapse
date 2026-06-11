@@ -26,13 +26,14 @@ import {
 import { getLLMRunner } from "../tencentdb/adapters/standalone/llm-runner";
 import {
   queryL0ForSession,
-  searchL1Fts,
+  searchL1FtsForUser,
   upsertL1,
   deleteL1Batch,
   getPipelineState,
   setPipelineState,
-  queryAllL1,
+  queryAllL1ForUser,
 } from "./store";
+import { sessionKeyForUser } from "./user-scope";
 
 const TAG = "[synapse][l1-pipeline]";
 const TRIGGER_EVERY_N = 5; // L1 trigger: every 5 conversation turns
@@ -65,7 +66,7 @@ export interface L1RunResult {
   newMemoryRecords: MemoryRecord[];
 }
 
-export async function runL1Pipeline(sessionKey: string, sessionId: string): Promise<L1RunResult> {
+export async function runL1Pipeline(sessionKey: string, sessionId: string, userId: string): Promise<L1RunResult> {
   const runner = getLLMRunner();
   const l0Messages = queryL0ForSession(sessionKey, 50);
   if (l0Messages.length === 0) return { newMemoryRecords: [] };
@@ -100,7 +101,6 @@ export async function runL1Pipeline(sessionKey: string, sessionId: string): Prom
     rawText = await runner.run({
       systemPrompt: EXTRACT_MEMORIES_SYSTEM_PROMPT,
       prompt: formatExtractionPrompt({ newMessages, backgroundMessages: bgMessages, previousSceneName }),
-      maxTokens: 4096,
     });
   } catch (err) {
     console.error(`${TAG} L1 extraction LLM failed:`, err);
@@ -121,11 +121,14 @@ export async function runL1Pipeline(sessionKey: string, sessionId: string): Prom
 
   if (allExtracted.length === 0) return { newMemoryRecords: [] };
 
-  // Step 2: Dedup — find candidates for each new memory
-  const existingTexts = queryAllL1(200).map((r) => r.content).join(" ");
+  // Step 2: Dedup — find candidates for each new memory. L1 memory is
+  // user-global, so dedup spans ALL of this user's sessions: the same fact
+  // mentioned in a new chat shouldn't be re-extracted as a fresh memory.
+  const userPrefix = sessionKeyForUser(userId);
+  const existingTexts = queryAllL1ForUser(userPrefix, 200).map((r) => r.content).join(" ");
   const matches: CandidateMatch[] = await Promise.all(
     allExtracted.map(async (em) => {
-      const candidates = searchL1Fts(em.content, 5);
+      const candidates = searchL1FtsForUser(em.content, userPrefix, 5);
       return { newMemory: em, candidates };
     }),
   );
@@ -146,7 +149,6 @@ export async function runL1Pipeline(sessionKey: string, sessionId: string): Prom
       const dedupRaw = await runner.run({
         systemPrompt: CONFLICT_DETECTION_SYSTEM_PROMPT,
         prompt: formatBatchConflictPrompt(matches),
-        maxTokens: 2048,
       });
       decisions = parseDedupResponse(dedupRaw, allExtracted);
     } catch (err) {

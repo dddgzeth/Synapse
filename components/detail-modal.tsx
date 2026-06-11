@@ -11,6 +11,7 @@
 
 import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { useI18n } from "./i18n";
 
 type DetailRequest =
@@ -193,7 +194,7 @@ function SceneView({ scene, locale }: { scene: ScenePayload; locale: string }) {
         <span style={{ ...pill, opacity: 0.7 }}>{scene.filename}</span>
       </div>
       <div className="prose" style={proseBox}>
-        <ReactMarkdown>{scene.content}</ReactMarkdown>
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{scene.content}</ReactMarkdown>
       </div>
     </>
   );

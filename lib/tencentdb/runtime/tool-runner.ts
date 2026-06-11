@@ -63,7 +63,6 @@ export class CleanContextRunner implements LLMRunner {
 
   async run(params: LLMRunParams): Promise<string> {
     const timeoutMs = params.timeoutMs ?? 120_000;
-    const maxTokens = params.maxTokens ?? 4096;
 
     const rawBase = process.env.ANTHROPIC_BASE_URL ?? "https://www.fucheers.top";
     const baseURL = rawBase.endsWith("/v1") ? rawBase : `${rawBase.replace(/\/$/, "")}/v1`;
@@ -76,11 +75,13 @@ export class CleanContextRunner implements LLMRunner {
     const tools = this.enableTools ? this.buildTools(params.workspaceDir) : undefined;
 
     const t0 = Date.now();
+    // No maxOutputTokens — let the model run to completion under the model's
+    // own cap. Internal callers used to set this to 4096 which truncated
+    // long structured outputs (L1 dedup, scene extraction).
     const result = await generateText({
       model,
       ...(params.systemPrompt ? { system: params.systemPrompt } : {}),
       prompt: params.prompt,
-      maxOutputTokens: maxTokens,
       abortSignal: AbortSignal.timeout(timeoutMs),
       ...(tools ? { tools, stopWhen: stepCountIs(this.maxSteps) } : {}),
     });

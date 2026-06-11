@@ -9,7 +9,6 @@
 import { usePathname } from "next/navigation";
 import { Sidebar } from "./sidebar";
 import { DetailModal } from "./detail-modal";
-import { AhaModal } from "./aha-modal";
 import { I18nProvider } from "./i18n";
 import { AuthProvider } from "./auth-provider";
 
@@ -28,9 +27,9 @@ export function AppShell({ children }: { children: React.ReactNode }) {
             <div style={{ flex: 1, overflow: "auto", minWidth: 0 }}>
               {children}
             </div>
-            {/* Floating modals — listen for window events */}
+            {/* DetailModal still listens for inline detail events. AhaModal
+                was removed — Aha now lives at /aha/[id] as a full route. */}
             <DetailModal />
-            <AhaModal />
           </div>
         )}
       </I18nProvider>

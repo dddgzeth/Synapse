@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from "react";
 import Link from "next/link";
+import { usePathname, useRouter } from "next/navigation";
 import { signOut, useSession } from "next-auth/react";
 import {
   loadFolderHandles,
@@ -14,6 +15,7 @@ import { collectSyncedFilesIndex } from "@/lib/synced-files";
 import { setSyncedFiles } from "@/lib/synced-files-bus";
 import type { FolderTreeNode } from "@/lib/synced-files-types";
 import { useI18n, type ApiSettings } from "./i18n";
+import { SynnyMascot } from "./synny-mascot";
 
 interface SceneBlock {
   filename: string;
@@ -31,6 +33,22 @@ interface RecentMemory {
   priority: number;
   scene_name: string;
   updatedAt: string;
+}
+
+interface SearchHit {
+  recordId: string;
+  sessionKey: string;
+  sessionTitle: string;
+  role: string;
+  snippet: string;
+  recordedAt: string;
+}
+
+interface ChatSession {
+  sessionKey: string;
+  title: string;
+  lastMessageAt: string;
+  messageCount: number;
 }
 
 interface MemoriesData {
@@ -100,15 +118,19 @@ const REFRESH_EVENT = "synapse:memory-update";
 
 export function Sidebar() {
   const { t, locale } = useI18n();
+  const router = useRouter();
+  const pathname = usePathname();
   const { data: session, status: sessionStatus } = useSession();
   const userId = session?.user?.id ?? null;
   const [data, setData] = useState<MemoriesData | null>(null);
   const [folders, setFolders] = useState<SyncedFolder[]>([]);
   const [uploading, setUploading] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
-  const [searchResults, setSearchResults] = useState<MemoriesData["recentMemories"] | null>(null);
+  const [searchResults, setSearchResults] = useState<SearchHit[] | null>(null);
   const [searching, setSearching] = useState(false);
   const [refreshTick, setRefreshTick] = useState(0);
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSessionKey, setActiveSessionKey] = useState<string | null>(null);
   // Per-folder ephemeral scan progress: { [folderName]: discoveredFileCount }.
   // Lives in component state because it's transient and not part of SyncedFolder.
   const [scanProgress, setScanProgress] = useState<Record<string, number>>({});
@@ -132,19 +154,31 @@ export function Sidebar() {
       .then((r) => r.json())
       .then((d) => setAhaHistory(d.items ?? []))
       .catch(() => {});
+    // Per-user chat sessions list (derived from L0 group-by).
+    fetch("/api/sessions")
+      .then((r) => r.json())
+      .then((d) => {
+        setSessions(d.sessions ?? []);
+        if (!activeSessionKey && d.defaultSessionKey) {
+          setActiveSessionKey(d.defaultSessionKey);
+        }
+      })
+      .catch(() => {});
   }, [refreshTick]);
 
-  // Also refresh history right after closing the modal (badge clicked).
+  // Listen for session changes (driven by synapse-app on its own; we just mirror).
   useEffect(() => {
-    const onModalSeen = () => {
-      fetch("/api/aha/history")
-        .then((r) => r.json())
-        .then((d) => setAhaHistory(d.items ?? []))
-        .catch(() => {});
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { sessionKey: string };
+      if (detail?.sessionKey) setActiveSessionKey(detail.sessionKey);
     };
-    window.addEventListener("synapse:open-aha", onModalSeen);
-    return () => window.removeEventListener("synapse:open-aha", onModalSeen);
+    window.addEventListener("synapse:set-session", handler);
+    return () => window.removeEventListener("synapse:set-session", handler);
   }, []);
+
+  // History refreshes via `refreshTick` whenever a chat turn / aha trigger
+  // fires elsewhere, so no extra listener is needed here. (The old listener
+  // was tied to the now-removed `synapse:open-aha` modal event.)
 
   // Listen for cross-component refresh signal (chat sent a message, files uploaded, etc.).
   useEffect(() => {
@@ -368,6 +402,63 @@ export function Sidebar() {
     }
   }
 
+  // ── Chat session management ────────────────────────────────────────
+  function switchSession(sessionKey: string, recordId?: string) {
+    setActiveSessionKey(sessionKey);
+    // Persist across route changes so navigating from /persona → / picks it up.
+    try {
+      sessionStorage.setItem("synapse:pending-session", JSON.stringify({
+        sessionKey, recordId: recordId ?? null,
+      }));
+    } catch { /* ignore */ }
+    // Dispatch immediately for the in-page case (SynapseApp already mounted).
+    window.dispatchEvent(new CustomEvent("synapse:set-session", {
+      detail: { sessionKey, ...(recordId ? { recordId } : {}) },
+    }));
+    // If the user is on /persona, /scenes/..., /memories/..., go back to /
+    // so SynapseApp actually mounts and picks up the pending session.
+    if (pathname && pathname !== "/") {
+      router.push("/");
+    }
+  }
+
+  function startNewSession() {
+    if (!userId) return;
+    const newKey = `chat_${userId}_${Date.now().toString(36)}`;
+    // No L0 rows yet — the session "exists" once the first message is sent.
+    switchSession(newKey);
+  }
+
+  async function deleteSessionAndRefresh(sessionKey: string) {
+    if (!confirm(t.common.confirmDeleteConversation)) return;
+    try {
+      await fetch(`/api/sessions?key=${encodeURIComponent(sessionKey)}`, { method: "DELETE" });
+      setSessions((prev) => prev.filter((s) => s.sessionKey !== sessionKey));
+      // If the deleted session was active, fall back to default.
+      if (activeSessionKey === sessionKey && userId) {
+        switchSession(`chat_${userId}`);
+      }
+      setRefreshTick((n) => n + 1);
+    } catch (err) {
+      console.warn("[sidebar] delete session failed:", err);
+    }
+  }
+
+  async function deleteAhaInsight(id: string) {
+    if (!confirm(t.common.confirmDeleteInsight)) return;
+    try {
+      await fetch(`/api/aha/${encodeURIComponent(id)}`, { method: "DELETE" });
+      setAhaHistory((prev) => prev.filter((a) => a.id !== id));
+      // Refresh aha state (the deleted item may have been the active "last" one,
+      // in which case the badge should disappear too).
+      const r = await fetch("/api/aha/last", { cache: "no-store" });
+      const j = await r.json();
+      setAhaUnseen(!!j.unseen);
+    } catch (err) {
+      console.warn("[sidebar] delete aha failed:", err);
+    }
+  }
+
   async function handleFileClick(node: TreeNode) {
     try {
       const fileHandle = node.handle as FileSystemFileHandle;
@@ -429,20 +520,39 @@ export function Sidebar() {
     }}>
       {/* Header */}
       <div style={{ padding: "14px 16px 10px", position: "relative" }}>
-        {/* eslint-disable-next-line @next/next/no-img-element */}
-        <img
-          src="/logo-horizontal.jpg"
-          alt="Synapse"
-          style={{ height: 40, width: "auto", mixBlendMode: "multiply", display: "block", marginLeft: -4 }}
-        />
-        <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4 }}>
-          {data ? t.sidebar.memoryStats(data.l1Count, Math.round(data.l0Count / 2)) : t.sidebar.loadingStats}
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src="/logo-horizontal.jpg"
+            alt="Synapse"
+            style={{ height: 40, width: "auto", mixBlendMode: "multiply", display: "block", marginLeft: -4 }}
+          />
+          <SynnyMascot size={34} style={{ flexShrink: 0 }} />
+        </div>
+        <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 4, display: "flex", alignItems: "center", gap: 8 }}>
+          <span>{data ? t.sidebar.memoryStats(data.l1Count, Math.round(data.l0Count / 2)) : t.sidebar.loadingStats}</span>
+          {data && (data.l1Count > 0 || data.l0Count > 0) && (
+            <a
+              href="/api/memories/export"
+              download
+              title={t.sidebar.exportMemoriesTitle}
+              style={{
+                color: "var(--accent)", textDecoration: "none",
+                fontSize: 11, fontWeight: 600, whiteSpace: "nowrap",
+                cursor: "pointer", opacity: 0.85,
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.opacity = "1")}
+              onMouseLeave={(e) => (e.currentTarget.style.opacity = "0.85")}
+            >
+              ⬇ {t.sidebar.exportMemories}
+            </a>
+          )}
         </div>
         {ahaUnseen && (
           <button
             onClick={() => {
-              window.dispatchEvent(new CustomEvent("synapse:open-aha"));
-              // Optimistically clear; server is updated by the modal.
+              router.push("/aha/latest");
+              // Optimistically clear; server is updated by the route handler.
               setAhaUnseen(false);
             }}
             title={t.sidebar.newInsightTitle}
@@ -493,14 +603,55 @@ export function Sidebar() {
 
       <div className="scrollbar-thin" style={{ flex: 1, overflowY: "auto" }}>
 
-        {/* Search Results */}
+        {/* Search Results — L0 conversation hits across all sessions */}
         {searchResults !== null && (
           <Section label={t.sidebar.searchResults(searchResults.length)}>
             {searchResults.length === 0 ? (
               <div style={{ padding: "8px 14px", fontSize: 12, color: "var(--text-muted)" }}>{t.sidebar.noResults}</div>
             ) : (
-              searchResults.slice(0, 10).map((m) => <MemoryRow key={m.id} m={m} />)
+              searchResults.slice(0, 20).map((hit) => (
+                <SearchHitRow
+                  key={hit.recordId}
+                  hit={hit}
+                  query={searchQuery}
+                  onJump={() => {
+                    switchSession(hit.sessionKey, hit.recordId);
+                    setSearchQuery("");
+                  }}
+                />
+              ))
             )}
+          </Section>
+        )}
+
+        {/* Conversations — list all sessions for this user */}
+        {searchResults === null && (
+          <Section label={`Conversations (${sessions.length})`}>
+            <button
+              onClick={startNewSession}
+              style={{
+                width: "calc(100% - 28px)", margin: "4px 14px 6px",
+                padding: "7px 10px", background: "var(--surface)",
+                border: "1px dashed var(--border)", borderRadius: 8,
+                color: "var(--accent)", cursor: "pointer", fontSize: 12, fontWeight: 600,
+              }}
+            >+ New chat</button>
+            <div style={{ overflowY: "auto", maxHeight: "calc(10 * 40px)" }}>
+              {sessions.map((s) => (
+                <SessionRow
+                  key={s.sessionKey}
+                  session={s}
+                  active={s.sessionKey === activeSessionKey}
+                  onClick={() => switchSession(s.sessionKey)}
+                  onDelete={() => deleteSessionAndRefresh(s.sessionKey)}
+                />
+              ))}
+              {sessions.length === 0 && (
+                <div style={{ padding: "6px 14px", fontSize: 11, color: "var(--text-muted)" }}>
+                  Start chatting to create your first conversation.
+                </div>
+              )}
+            </div>
           </Section>
         )}
 
@@ -535,32 +686,47 @@ export function Sidebar() {
           </Section>
         )}
 
+        {/* Manual Aha trigger — let the user look back at their recent threads
+            on demand, in addition to the passive background detection. */}
+        {searchResults === null && (
+          <Section label="✨ Threads">
+            <LookBackButton onTriggered={() => setRefreshTick((n) => n + 1)} />
+          </Section>
+        )}
+
         {/* Aha History — every detected Aha, clickable to re-open in modal */}
         {searchResults === null && ahaHistory.length > 0 && (
           <Section label={`✨ ${t.sidebar.ahaHistory(ahaHistory.length)}`}>
-            {ahaHistory.slice(0, 10).map((item) => (
-              <AhaHistoryRow key={item.id} item={item} locale={locale} />
-            ))}
+            <div style={{ overflowY: "auto", maxHeight: "calc(10 * 52px)" }}>
+              {ahaHistory.map((item) => (
+                <AhaHistoryRow key={item.id} item={item} locale={locale} onDelete={deleteAhaInsight} />
+              ))}
+            </div>
           </Section>
         )}
 
         {/* L3 Persona — link to /persona */}
         {searchResults === null && data?.persona && (
           <Section label={t.sidebar.persona}>
-            <PersonaLink />
+            <PersonaLink persona={data.persona} />
           </Section>
         )}
 
         {/* L2 Scenes — each row links to /scenes/[filename] */}
         {searchResults === null && data && data.scenes.length > 0 && (
           <Section label={t.sidebar.scenes(data.scenes.length)}>
-            {data.scenes.map((scene) => <SceneRow key={scene.filename} scene={scene} />)}
+            <div style={{ overflowY: "auto", maxHeight: "calc(10 * 52px)" }}>
+              {data.scenes.map((scene) => <SceneRow key={scene.filename} scene={scene} />)}
+            </div>
           </Section>
         )}
 
-        {/* Recent Memories — each row links to /memories/[id] */}
+        {/* Recent Memories — disabled per user request (2026-05-26). L1 records
+            still exist in the DB and are searched/retrieved by the LLM; only the
+            sidebar list view is hidden. */}
+        {/*
         {searchResults === null && data && data.recentMemories.length > 0 && (
-          <Section label={t.sidebar.recentMemories(data.recentMemories.length)}>
+          <Section label={t.sidebar.recentMemories(data.l1Count)}>
             {data.recentMemories.slice(0, 15).map((m) => <MemoryRow key={m.id} m={m} />)}
           </Section>
         )}
@@ -573,8 +739,125 @@ export function Sidebar() {
             </div>
           </div>
         )}
+        */}
       </div>
       <AccountCenter />
+    </div>
+  );
+}
+
+function SearchHitRow({
+  hit, query, onJump,
+}: {
+  hit: SearchHit; query: string; onJump: () => void;
+}) {
+  const dateStr = hit.recordedAt
+    ? new Date(hit.recordedAt).toLocaleString(undefined, {
+        month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+      })
+    : "";
+  return (
+    <button
+      onClick={onJump}
+      title={hit.snippet}
+      style={{
+        display: "block", width: "calc(100% - 12px)", margin: "2px 6px",
+        padding: "7px 10px", textAlign: "left",
+        background: "transparent", border: "none",
+        borderRadius: 6, cursor: "pointer",
+        color: "inherit", fontFamily: "inherit",
+        transition: "background 0.12s",
+      }}
+      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--surface)")}
+      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+        <span style={{
+          fontSize: 10, padding: "1px 5px", borderRadius: 4,
+          background: hit.role === "user" ? "rgba(124,110,247,0.12)" : "rgba(16,185,129,0.12)",
+          color: hit.role === "user" ? "#7C6EF7" : "#10B981", fontWeight: 600,
+        }}>{hit.role}</span>
+        <span style={{
+          fontSize: 11, color: "var(--text-muted)", flex: 1,
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+        }}>{hit.sessionTitle}</span>
+        <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{dateStr}</span>
+      </div>
+      <div style={{
+        fontSize: 12, color: "var(--text)", lineHeight: 1.5,
+        display: "-webkit-box", WebkitBoxOrient: "vertical", WebkitLineClamp: 2,
+        overflow: "hidden",
+      }}>
+        {highlightMatches(hit.snippet, query)}
+      </div>
+    </button>
+  );
+}
+
+function highlightMatches(text: string, query: string): React.ReactNode {
+  const term = query.trim().split(/\s+/)[0];
+  if (!term) return text;
+  const lower = text.toLowerCase();
+  const needle = term.toLowerCase();
+  const idx = lower.indexOf(needle);
+  if (idx < 0) return text;
+  return (
+    <>
+      {text.slice(0, idx)}
+      <mark style={{ background: "rgba(245,197,126,0.55)", color: "inherit", padding: 0 }}>
+        {text.slice(idx, idx + needle.length)}
+      </mark>
+      {text.slice(idx + needle.length)}
+    </>
+  );
+}
+
+function SessionRow({
+  session, active, onClick, onDelete,
+}: {
+  session: ChatSession; active: boolean;
+  onClick: () => void; onDelete: () => void;
+}) {
+  const dateStr = session.lastMessageAt
+    ? new Date(session.lastMessageAt).toLocaleString(undefined, {
+        month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+      })
+    : "";
+  const [hover, setHover] = useState(false);
+  return (
+    <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{
+        display: "flex", alignItems: "center", gap: 4,
+        padding: "6px 10px 6px 14px",
+        background: active ? "var(--surface)" : "transparent",
+        borderLeft: active ? "2px solid var(--accent)" : "2px solid transparent",
+        cursor: "pointer",
+        transition: "background 0.12s",
+      }}
+      onClick={onClick}
+    >
+      <div style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
+        <div style={{
+          fontSize: 12, color: "var(--text)", fontWeight: active ? 600 : 500,
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+        }}>{session.title}</div>
+        <div style={{ fontSize: 10, color: "var(--text-muted)" }}>
+          {session.messageCount} msgs · {dateStr}
+        </div>
+      </div>
+      {hover && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onDelete(); }}
+          title="Delete conversation"
+          style={{
+            background: "none", border: "none", cursor: "pointer",
+            color: "var(--text-muted)", fontSize: 14, padding: "2px 4px",
+            opacity: 0.7,
+          }}
+        >🗑</button>
+      )}
     </div>
   );
 }
@@ -669,69 +952,178 @@ function SceneRow({ scene }: { scene: SceneBlock }) {
   );
 }
 
-function AhaHistoryRow({ item, locale }: { item: AhaHistoryItem; locale: string }) {
+function LookBackButton({ onTriggered }: { onTriggered: () => void }) {
+  const router = useRouter();
+  const [loading, setLoading] = useState(false);
+  const [hint, setHint] = useState<string | null>(null);
+  async function run() {
+    if (loading) return;
+    setLoading(true);
+    setHint(null);
+    try {
+      const r = await fetch("/api/aha/last?force=1", { cache: "no-store" });
+      const j = await r.json();
+      if (j?.aha?.id) {
+        // Navigate to the full-page view of the freshly-generated insight.
+        router.push(`/aha/${encodeURIComponent(j.aha.id)}`);
+        onTriggered();
+      } else {
+        setHint(j?.reason ?? "No threads yet — keep chatting to build memory.");
+        setTimeout(() => setHint(null), 4000);
+      }
+    } catch (err) {
+      setHint(err instanceof Error ? err.message : String(err));
+      setTimeout(() => setHint(null), 4000);
+    } finally {
+      setLoading(false);
+    }
+  }
+  return (
+    <div style={{ padding: "2px 12px 6px" }}>
+      <button
+        onClick={run}
+        disabled={loading}
+        style={{
+          width: "100%", padding: "7px 10px",
+          background: loading ? "var(--surface-2)" : "var(--surface)",
+          border: "1px dashed var(--border)", borderRadius: 8,
+          color: loading ? "var(--text-muted)" : "var(--accent)",
+          cursor: loading ? "wait" : "pointer", fontSize: 12, fontWeight: 600,
+          transition: "background 0.12s",
+        }}
+        onMouseEnter={(e) => { if (!loading) e.currentTarget.style.background = "var(--insight)"; }}
+        onMouseLeave={(e) => { if (!loading) e.currentTarget.style.background = "var(--surface)"; }}
+      >
+        {loading ? "Analyzing your trajectories…" : "📈 Look back at recent threads"}
+      </button>
+      {hint && (
+        <div style={{ marginTop: 6, fontSize: 11, color: "var(--text-muted)", padding: "0 2px" }}>
+          {hint}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AhaHistoryRow({
+  item, locale, onDelete,
+}: {
+  item: AhaHistoryItem;
+  locale: string;
+  onDelete: (id: string) => void;
+}) {
   const { t } = useI18n();
+  const router = useRouter();
+  const [hover, setHover] = useState(false);
   const date = item.detectedAt
     ? new Date(item.detectedAt).toLocaleString(locale, {
         month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
       })
     : "";
   return (
-    <button
-      onClick={() =>
-        window.dispatchEvent(
-          new CustomEvent("synapse:open-aha", { detail: { id: item.id } }),
-        )
-      }
+    <div
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      onClick={() => router.push(`/aha/${encodeURIComponent(item.id)}`)}
       title={item.observation}
       style={{
-        display: "block", width: "calc(100% - 12px)", margin: "2px 6px",
+        position: "relative",
+        width: "calc(100% - 12px)", margin: "2px 6px",
         padding: "7px 10px",
-        background: "transparent", border: "none",
-        textAlign: "left", cursor: "pointer", borderRadius: 6,
+        background: hover ? "var(--insight)" : "transparent",
+        borderRadius: 6,
         transition: "background 0.12s",
-        color: "inherit", fontFamily: "inherit",
+        color: "inherit",
+        cursor: "pointer",
       }}
-      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--insight)")}
-      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 3 }}>
         <span style={{ fontSize: 11 }}>✨</span>
-        <span style={{
-          fontSize: 10, color: "var(--text-muted)",
-        }}>{date}</span>
+        <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{date}</span>
       </div>
       <div style={{
         fontSize: 12, color: "var(--text)", lineHeight: 1.45,
         display: "-webkit-box", WebkitBoxOrient: "vertical", WebkitLineClamp: 2,
         overflow: "hidden",
+        paddingRight: hover ? 22 : 0,  // make room for the trash button on hover
+        transition: "padding 0.12s",
       }}>
         {item.pattern || item.observation || t.common.none}
       </div>
-    </button>
+      {hover && (
+        <button
+          onClick={(e) => { e.stopPropagation(); onDelete(item.id); }}
+          title={t.common.delete}
+          style={{
+            position: "absolute", top: 4, right: 4,
+            background: "none", border: "none", cursor: "pointer",
+            color: "var(--text-muted)", fontSize: 14, padding: "2px 4px",
+            lineHeight: 1, opacity: 0.7,
+          }}
+          onMouseEnter={(e) => (e.currentTarget.style.opacity = "1")}
+          onMouseLeave={(e) => (e.currentTarget.style.opacity = "0.7")}
+        >🗑</button>
+      )}
+    </div>
   );
 }
 
-function PersonaLink() {
+// Extract the short quoted label from the Archetype line, e.g. "务实建造者".
+// The persona-generation prompt always ends the Archetype sentence with a quoted
+// core label inside curly/straight double-quotes.
+function extractPersonaLabel(persona: string): string {
+  const archetypeLine = persona.match(/>\s*\*\*Archetype[^*]*\*\*[：:]\s*(.+)/)?.[1] ?? "";
+  if (archetypeLine) {
+    // Match Chinese curly quotes "xxx" or straight "xxx"
+    const hits = [...archetypeLine.matchAll(/[“"]([^”"]{2,16})[”"]/g)];
+    if (hits.length > 0) return hits[hits.length - 1][1].trim();
+    // Fallback: last bold **xxx** in the line
+    const bolds = [...archetypeLine.matchAll(/\*\*([^*]{2,16})\*\*/g)];
+    if (bolds.length > 0) return bolds[bolds.length - 1][1].trim();
+  }
+  return "";
+}
+
+// Full Archetype sentence for the subtitle row.
+function extractPersonaSummary(persona: string): string {
+  const m = persona.match(/>\s*\*\*Archetype[^*]*\*\*[：:]\s*(.+)/);
+  if (m) return m[1].trim();
+  for (const line of persona.split("\n")) {
+    const clean = line.replace(/^[>#*\-\s]+/, "").trim();
+    if (clean.length > 10) return clean;
+  }
+  return "";
+}
+
+function PersonaLink({ persona }: { persona: string }) {
   const { t } = useI18n();
+  const label = extractPersonaLabel(persona);
+  const summary = extractPersonaSummary(persona);
   return (
-    <div style={{ padding: "2px 12px 6px" }}>
-      <Link
-        href="/persona"
-        style={{
-          display: "block", padding: "8px 12px",
-          background: "var(--surface)",
-          border: "1px solid var(--border)",
-          borderRadius: 8, textDecoration: "none",
-          color: "var(--accent)", fontWeight: 600, fontSize: 12,
-          transition: "background 0.12s",
-        }}
-        onMouseEnter={(e) => (e.currentTarget.style.background = "var(--insight)")}
-        onMouseLeave={(e) => (e.currentTarget.style.background = "var(--surface)")}
-      >
-        {t.sidebar.viewPersona}
-      </Link>
-    </div>
+    <Link
+      href="/persona"
+      style={{
+        display: "flex", alignItems: "center", gap: 6,
+        padding: "6px 12px", textDecoration: "none", color: "inherit",
+        userSelect: "none", transition: "background 0.12s",
+      }}
+      onMouseEnter={(e) => (e.currentTarget.style.background = "var(--surface)")}
+      onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+    >
+      <span style={{ fontSize: 12, flexShrink: 0 }}>🧠</span>
+      <div style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
+        <div style={{
+          fontSize: 12, color: "var(--text)", fontWeight: 600,
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+        }}>{label || t.sidebar.viewPersona}</div>
+        {summary && (
+          <div style={{
+            fontSize: 10, color: "var(--text-muted)",
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+          }}>{summary}</div>
+        )}
+      </div>
+    </Link>
   );
 }
 
