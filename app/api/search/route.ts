@@ -6,9 +6,11 @@
  * to the source session + message.
  */
 import { NextRequest, NextResponse } from "next/server";
-import { searchL0FtsForUser, queryL0HistoryForSession } from "@/lib/memory/store";
+import { queryL0HistoryForSession } from "@/lib/memory/store";
+import { searchL0HybridForUser } from "@/lib/memory/hybrid";
 import { getCurrentUserId } from "@/lib/auth-session";
-import { sessionKeyForUser } from "@/lib/memory/user-scope";
+import { sessionKeyForUser, parseExtSessionKey } from "@/lib/memory/user-scope";
+import { IMG_MARKER_RE } from "@/lib/attachments";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -20,18 +22,35 @@ interface SearchResultItem {
   role: string;
   snippet: string;       // ~200 chars around the match
   recordedAt: string;
+  sessionId: string;     // L0 session_id (for scrolling within an archive)
+  sourceLabel?: string;  // e.g. 'Claude Code / synapse' for external-tool hits
+  source?: string;       // slug, present only for external-tool hits
+  project?: string;      // slug, present only for external-tool hits
 }
 
 const SNIPPET_LEN = 220;
 
 function buildSnippet(text: string, query: string): string {
   if (!text) return "";
+  // Image markers live in L0 text ([img:name] + [img-desc]…[/img-desc]).
+  // Keep the transcript CONTENT (a hit inside it is a legit match the user
+  // should see) but swap the raw markers for a readable label.
+  text = text
+    .replace(IMG_MARKER_RE, "")
+    .replace(/\[img-desc\]/g, "〔图片内容〕")
+    .replace(/\[\/img-desc\]/g, "")
+    .trim();
   const lower = text.toLowerCase();
   const hit = lower.indexOf(query.toLowerCase().split(/\s+/)[0] ?? "");
   if (hit < 0 || text.length <= SNIPPET_LEN) return text.slice(0, SNIPPET_LEN);
   const start = Math.max(0, hit - 60);
   const end = Math.min(text.length, start + SNIPPET_LEN);
   return (start > 0 ? "…" : "") + text.slice(start, end) + (end < text.length ? "…" : "");
+}
+
+function extLabel(source: string): string {
+  const m: Record<string, string> = { "claude-code": "Claude Code", codex: "Codex", cursor: "Cursor", mcp: "MCP" };
+  return m[source] ?? source;
 }
 
 export async function GET(req: NextRequest) {
@@ -41,7 +60,7 @@ export async function GET(req: NextRequest) {
   if (!q) return NextResponse.json({ results: [] });
 
   const prefix = sessionKeyForUser(userId);
-  const rows = searchL0FtsForUser(q, prefix, 30);
+  const rows = await searchL0HybridForUser(q, prefix, 30);
 
   // Pre-compute one title per sessionKey so we don't redo the SELECT per row.
   const titleCache = new Map<string, string>();
@@ -59,14 +78,22 @@ export async function GET(req: NextRequest) {
     return title;
   }
 
-  const results: SearchResultItem[] = rows.map((r) => ({
-    recordId: r.record_id,
-    sessionKey: r.session_key,
-    sessionTitle: titleFor(r.session_key),
-    role: r.role,
-    snippet: buildSnippet(r.message_text, q),
-    recordedAt: r.recorded_at,
-  }));
+  const results: SearchResultItem[] = rows.map((r) => {
+    const ext = parseExtSessionKey(r.session_key);
+    return {
+      recordId: r.record_id,
+      sessionKey: r.session_key,
+      sessionTitle: titleFor(r.session_key),
+      role: r.role,
+      snippet: buildSnippet(r.message_text, q),
+      recordedAt: r.recorded_at,
+      sessionId: r.session_id,
+      // Provenance for hits that came from an external tool (Claude Code/etc).
+      sourceLabel: ext ? `${extLabel(ext.source)}${ext.project ? ` / ${ext.project}` : ""}` : undefined,
+      source: ext?.source,
+      project: ext?.project,
+    };
+  });
 
   return NextResponse.json({ results });
 }

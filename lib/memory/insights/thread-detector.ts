@@ -80,9 +80,10 @@ function scoreThread(t: MemoryThread, now: number): number {
  * so the model can reason about temporal evolution explicitly.
  */
 export function formatThreadForPrompt(thread: MemoryThread): string {
-  const lines = thread.memories.map((m) => {
+  // Numbered so the generator can cite evidence by index ("evidence": [{i, why}]).
+  const lines = thread.memories.map((m, i) => {
     const date = m.createdAt.slice(0, 10);
-    return `[${date}] (${m.type}) ${m.content}`;
+    return `${i + 1}. [${date}] (${m.type}) ${m.content}`;
   });
   return `Scene: ${thread.sceneName}\n${lines.join("\n")}`;
 }

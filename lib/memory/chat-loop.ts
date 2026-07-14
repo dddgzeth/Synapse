@@ -17,6 +17,12 @@
  */
 
 import { z } from "zod";
+import type { LLMProvider, OpenAIMessage, OpenAITool } from "@/lib/llm/provider";
+import { LLMHttpError } from "@/lib/llm/provider";
+
+// OpenAIMessage now lives in the provider (single source of truth). Re-exported
+// so existing importers (`@/lib/memory/chat-loop`) keep working unchanged.
+export type { OpenAIMessage } from "@/lib/llm/provider";
 
 // ─────────────────────────────────────
 // Types
@@ -30,20 +36,6 @@ export interface ToolSpec {
 }
 
 export type Tools = Record<string, ToolSpec>;
-
-export type OpenAIMessage =
-  | { role: "system"; content: string }
-  | { role: "user"; content: string | Array<{ type: string; [k: string]: unknown }> }
-  | {
-      role: "assistant";
-      content: string | null;
-      tool_calls?: Array<{
-        id: string;
-        type: "function";
-        function: { name: string; arguments: string };
-      }>;
-    }
-  | { role: "tool"; tool_call_id: string; content: string };
 
 export type ChatLoopResult =
   | { kind: "final"; text: string; messages: OpenAIMessage[] }
@@ -75,13 +67,10 @@ export interface RunChatLoopParams {
    *  appended assistant tool_calls + tool_results from a resumed round. */
   messages: OpenAIMessage[];
   tools: Tools;
-  baseURL: string;          // e.g. "https://www.fucheers.top/v1"
-  apiKey: string;
-  model: string;            // e.g. "claude-sonnet-4-6"
+  /** LLM backend — abstracts fucheers/openai/anthropic behind one seam. */
+  provider: LLMProvider;
   maxSteps?: number;
   timeoutMs?: number;
-  /** Hook to rewrite outgoing body (e.g. for vision attachments). */
-  fetchImpl?: typeof fetch;
   /** Optional progress emitter — route handler uses this to stream UI events. */
   onEvent?: (event: ChatLoopEvent) => void;
 }
@@ -136,10 +125,7 @@ function totalMessageChars(messages: OpenAIMessage[], systemPrompt: string): num
  */
 async function compactOnce(
   messages: OpenAIMessage[],
-  baseURL: string,
-  apiKey: string,
-  model: string,
-  fetchImpl: typeof fetch,
+  provider: LLMProvider,
   onEvent?: (e: ChatLoopEvent) => void,
   reason: "context-budget" | "context-error" | "timeout-retry" = "context-error",
 ): Promise<{ messages: OpenAIMessage[]; compacted: boolean }> {
@@ -161,37 +147,22 @@ async function compactOnce(
 
   let summary: string;
   try {
-    const resp = await fetchImpl(`${baseURL}/chat/completions`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({
-        model,
-        stream: false,
-        // No max_tokens — the prompt asks for a dense summary, let the model
-        // decide its own length so important facts aren't cut off.
-        messages: [
-          {
-            role: "system",
-            content:
-              "You compress a tool's raw output into a dense factual summary. " +
-              "Keep ALL named entities, numbers, file paths, conclusions, decisions, and specific claims. " +
-              "Drop boilerplate, repetition, and prose decoration. " +
-              "Output only the summary — no preface, no meta-commentary.",
-          },
-          {
-            role: "user",
-            // Cap input to 100k chars so the summarizer itself doesn't time out.
-            content: original.length > 100_000
-              ? original.slice(0, 50_000) + "\n\n[...middle elided...]\n\n" + original.slice(-50_000)
-              : original,
-          },
-        ],
-      }),
+    const res = await provider.chatCompletion({
+      system:
+        "You compress a tool's raw output into a dense factual summary. " +
+        "Keep ALL named entities, numbers, file paths, conclusions, decisions, and specific claims. " +
+        "Drop boilerplate, repetition, and prose decoration. " +
+        "Output only the summary — no preface, no meta-commentary.",
+      messages: [{
+        role: "user",
+        // Cap input to 100k chars so the summarizer itself doesn't time out.
+        content: original.length > 100_000
+          ? original.slice(0, 50_000) + "\n\n[...middle elided...]\n\n" + original.slice(-50_000)
+          : original,
+      }],
       signal: AbortSignal.timeout(90_000),
     });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const j = await resp.json();
-    summary = j.choices?.[0]?.message?.content ?? "";
+    summary = res.text ?? "";
     if (!summary || summary.length < 50) throw new Error("empty summary");
   } catch (err) {
     // Fall back to hard truncate so we make forward progress.
@@ -220,22 +191,13 @@ async function compactOnce(
 // rejected the request.
 // async function compactUntilBudget(...) { ... }
 
-class ApiResponseError extends Error {
-  constructor(
-    public readonly status: number,
-    public readonly body: string,
-  ) {
-    super(`provider ${status}: ${body.slice(0, 300)}`);
-  }
-}
-
 function isAbortError(e: unknown): boolean {
   if (!(e instanceof Error)) return false;
   return e.name === "AbortError" || /aborted/i.test(e.message);
 }
 
 function isContextWindowError(e: unknown): boolean {
-  const text = e instanceof ApiResponseError
+  const text = e instanceof LLMHttpError
     ? `${e.status} ${e.body}`.toLowerCase()
     : e instanceof Error
       ? e.message.toLowerCase()
@@ -254,12 +216,11 @@ function isContextWindowError(e: unknown): boolean {
 export async function runChatLoop(params: RunChatLoopParams): Promise<ChatLoopResult> {
   const {
     systemPrompt, messages: initialMessages, tools,
-    baseURL, apiKey, model,
+    provider,
     maxSteps = 20,
     // Per-step timeout is adaptive (see computeStepTimeout below). The static
     // `timeoutMs` only acts as an upper cap.
     timeoutMs = 300_000,
-    fetchImpl = fetch,
     onEvent,
   } = params;
 
@@ -267,74 +228,43 @@ export async function runChatLoop(params: RunChatLoopParams): Promise<ChatLoopRe
   const toolDefs = toolsToOpenAI(tools);
 
   for (let step = 0; step < maxSteps; step++) {
-    // Helper to do the actual fucheers call with adaptive timeout. Returns
-    // either a parsed response or throws.
-    const callFucheers = async (): Promise<any> => {
-      const body: any = {
-        model,
-        stream: false,
-        // No max_tokens — let the model run to completion. The proxy will
-        // honour the model's own default cap.
-        messages: [
-          { role: "system", content: systemPrompt },
-          ...messages,
-        ],
-      };
-      if (toolDefs.length > 0) {
-        body.tools = toolDefs;
-        body.tool_choice = "auto";
-      }
+    // One non-streaming completion through the provider, with adaptive timeout.
+    const callLLM = async () => {
       const promptChars = totalMessageChars(messages, systemPrompt);
       // Budget for generation time without a maxTokens hint: assume up to
       // ~30k token output (worst case ≈ 5 minutes streaming).
-      const adaptiveTimeout = Math.min(
-        timeoutMs,
-        30_000 + promptChars * 5 + 240_000,
-      );
+      const adaptiveTimeout = Math.min(timeoutMs, 30_000 + promptChars * 5 + 240_000);
       onEvent?.({ kind: "step-start", step, promptChars, budgetMs: adaptiveTimeout });
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), adaptiveTimeout);
       try {
-        const resp = await fetchImpl(`${baseURL}/chat/completions`, {
-          method: "POST",
+        return await provider.chatCompletion({
+          system: systemPrompt,
+          messages,
+          tools: toolDefs.length > 0 ? (toolDefs as OpenAITool[]) : undefined,
           signal: controller.signal,
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-          body: JSON.stringify(body),
         });
-        clearTimeout(timer);
-        if (!resp.ok) {
-          const errBody = await resp.text().catch(() => "");
-          throw new ApiResponseError(resp.status, errBody);
-        }
-        return resp.json();
       } finally {
         clearTimeout(timer);
       }
     };
 
     // ── 1. Try the call. Only compact after a real provider context-window error.
-    let json: any;
+    let result: import("@/lib/llm/provider").ChatCompletionResult;
     try {
-      json = await callFucheers();
+      result = await callLLM();
     } catch (e) {
       if (isAbortError(e)) {
-        return {
-          kind: "error",
-          code: "request_timed_out",
-          messages,
-        };
+        return { kind: "error", code: "request_timed_out", messages };
       }
 
       if (isContextWindowError(e)) {
-        onEvent?.({
-          kind: "notice",
-          code: "context_too_long_retry",
-        });
-        const r = await compactOnce(messages, baseURL, apiKey, model, fetchImpl, onEvent, "context-error");
+        onEvent?.({ kind: "notice", code: "context_too_long_retry" });
+        const r = await compactOnce(messages, provider, onEvent, "context-error");
         if (r.compacted) {
           messages = r.messages;
           try {
-            json = await callFucheers();
+            result = await callLLM();
           } catch (e2) {
             if (isContextWindowError(e2)) {
               return { kind: "error", code: "context_still_too_long", messages };
@@ -347,11 +277,7 @@ export async function runChatLoop(params: RunChatLoopParams): Promise<ChatLoopRe
             };
           }
         } else {
-          return {
-            kind: "error",
-            code: "context_too_long_no_compactable",
-            messages,
-          };
+          return { kind: "error", code: "context_too_long_no_compactable", messages };
         }
       } else {
         const msg = e instanceof Error ? e.message : String(e);
@@ -359,13 +285,8 @@ export async function runChatLoop(params: RunChatLoopParams): Promise<ChatLoopRe
       }
     }
 
-    const choice = json.choices?.[0];
-    if (!choice) {
-      return { kind: "error", code: "provider_error", error: "no choice in response", messages };
-    }
-    const assistantMsg = choice.message;
-    const toolCalls = assistantMsg?.tool_calls ?? [];
-    const text: string = assistantMsg?.content ?? "";
+    const toolCalls = result.toolCalls;
+    const text = result.text;
 
     // No tool calls → final answer.
     if (toolCalls.length === 0) {
@@ -377,20 +298,17 @@ export async function runChatLoop(params: RunChatLoopParams): Promise<ChatLoopRe
     messages.push({
       role: "assistant",
       content: text || null,
-      tool_calls: toolCalls.map((tc: any) => ({
+      tool_calls: toolCalls.map((tc) => ({
         id: tc.id,
         type: "function" as const,
-        function: {
-          name: tc.function.name,
-          arguments: tc.function.arguments || "{}",
-        },
+        function: { name: tc.name, arguments: tc.arguments || "{}" },
       })),
     });
 
     // Execute each tool call. Server-side execute → push tool_result and continue.
     // Client-side (no execute) → pause and ship to browser.
     for (const tc of toolCalls) {
-      const name = tc.function.name;
+      const name = tc.name;
       const spec = tools[name];
       if (!spec) {
         messages.push({
@@ -402,7 +320,7 @@ export async function runChatLoop(params: RunChatLoopParams): Promise<ChatLoopRe
       }
       let input: unknown;
       try {
-        input = JSON.parse(tc.function.arguments || "{}");
+        input = JSON.parse(tc.arguments || "{}");
       } catch {
         input = {};
       }

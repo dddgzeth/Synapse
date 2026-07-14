@@ -5,6 +5,8 @@ import { createContext, useContext, useEffect, useMemo, useState } from "react";
 export type Language = "en" | "zh";
 
 export interface ApiSettings {
+  /** "" | "default" = server env; else "fucheers" | "openai" | "anthropic". */
+  provider: string;
   apiKey: string;
   baseUrl: string;
   model: string;
@@ -23,6 +25,7 @@ const LANGUAGE_KEY = "synapse.language";
 const API_SETTINGS_KEY = "synapse.apiSettings";
 
 const defaultApiSettings: ApiSettings = {
+  provider: "",
   apiKey: "",
   baseUrl: "",
   model: "",
@@ -59,6 +62,7 @@ export const translations = {
       settings: "Settings",
       language: "Language",
       apiSettings: "API Settings",
+      mcpTools: "Connect AI tools",
       logout: "Log out",
       english: "English",
       chinese: "中文",
@@ -66,6 +70,11 @@ export const translations = {
     apiSettings: {
       title: "API Settings",
       description: "These values are stored locally in this browser and sent with chat or deep research requests when filled.",
+      provider: "Provider",
+      providerDefault: "Default (server)",
+      providerFucheers: "fucheers (proxy)",
+      providerOpenai: "OpenAI (direct)",
+      providerAnthropic: "Anthropic (direct)",
       apiKey: "API Key",
       apiKeyPlaceholder: "sk-...",
       baseUrl: "Base URL",
@@ -73,6 +82,14 @@ export const translations = {
       model: "Model",
       modelPlaceholder: "claude-sonnet-4-6",
       clear: "Clear",
+    },
+    tools: {
+      connectedTools: "Connected Tools",
+      connectATool: "+ Connect a tool",
+      readOnlyArchive: "Read-only archive",
+      empty: "No conversations archived from this tool yet.",
+      emptyHint: "No tools connected yet. Click below to connect Claude Code, Codex, Cursor…",
+      you: "You",
     },
     auth: {
       title: "Sign in to Synapse",
@@ -209,6 +226,7 @@ export const translations = {
     },
     aha: {
       noticed: "Synapse noticed",
+      whyEvidence: "Why this is evidence",
       noData: "No Aha data yet. Keep chatting to accumulate memories first.",
       noCache: "No cached Aha data",
       fullInsight: "View full insight ↓",
@@ -269,6 +287,7 @@ export const translations = {
       settings: "设置",
       language: "语言",
       apiSettings: "API 设置",
+      mcpTools: "连接 AI 工具",
       logout: "退出登录",
       english: "English",
       chinese: "中文",
@@ -276,6 +295,11 @@ export const translations = {
     apiSettings: {
       title: "API 设置",
       description: "这些值会保存在当前浏览器本地；填写后，聊天和深度研究请求会带上这些设置。",
+      provider: "模型后端",
+      providerDefault: "默认（服务器环境变量）",
+      providerFucheers: "fucheers（代理）",
+      providerOpenai: "OpenAI（直连）",
+      providerAnthropic: "Anthropic（直连）",
       apiKey: "API Key",
       apiKeyPlaceholder: "sk-...",
       baseUrl: "Base URL",
@@ -283,6 +307,14 @@ export const translations = {
       model: "Model",
       modelPlaceholder: "claude-sonnet-4-6",
       clear: "清空",
+    },
+    tools: {
+      connectedTools: "已连接的工具",
+      connectATool: "+ 连接一个工具",
+      readOnlyArchive: "只读归档",
+      empty: "这个工具还没有归档任何对话。",
+      emptyHint: "还没有连接工具。点下方连接 Claude Code / Codex / Cursor…",
+      you: "你",
     },
     auth: {
       title: "登录 Synapse",
@@ -419,6 +451,7 @@ export const translations = {
     },
     aha: {
       noticed: "Synapse 注意到",
+      whyEvidence: "为什么它是证据",
       noData: "暂无 Aha 数据。请先用 chat 累积一些记忆。",
       noCache: "暂无缓存的 Aha 数据",
       fullInsight: "查看完整洞察 ↓",
@@ -507,9 +540,12 @@ export function useI18n() {
 
 export function getApiSettingsForRequest(settings: ApiSettings): ApiSettings | undefined {
   const normalized = {
+    provider: (settings.provider ?? "").trim(),
     apiKey: settings.apiKey.trim(),
     baseUrl: settings.baseUrl.trim(),
     model: settings.model.trim(),
   };
-  return normalized.apiKey || normalized.baseUrl || normalized.model ? normalized : undefined;
+  return normalized.provider || normalized.apiKey || normalized.baseUrl || normalized.model
+    ? normalized
+    : undefined;
 }

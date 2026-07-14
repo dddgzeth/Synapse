@@ -4,6 +4,11 @@ import { getToken } from "next-auth/jwt";
 const PUBLIC_PATHS = [
   "/login",
   "/api/auth",
+  // MCP endpoint authenticates via Bearer PAT inside the route (lib/api-tokens),
+  // not via NextAuth cookies — terminal clients can't carry those.
+  "/api/mcp",
+  // Public: the auto-capture hook script, fetched by `curl` during setup.
+  "/api/hook",
   "/_next",
   "/favicon.ico",
   "/logo",
@@ -14,6 +19,8 @@ const PUBLIC_PATHS = [
 ];
 
 function isPublicPath(pathname: string): boolean {
+  // Public marketing landing page lives at the root path.
+  if (pathname === "/") return true;
   return PUBLIC_PATHS.some((path) => pathname === path || pathname.startsWith(`${path}/`));
 }
 

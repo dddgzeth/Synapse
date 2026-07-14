@@ -24,7 +24,7 @@ export default function PersonaPage() {
 
   return (
     <main style={pageWrap}>
-      <Link href="/" style={backLink}>{t.common.backToChat}</Link>
+      <Link href="/app" style={backLink}>{t.common.backToChat}</Link>
       <header style={{ marginBottom: 18 }}>
         <div style={eyebrow}>{t.details.personaEyebrow}</div>
         <h1 style={h1}>{t.details.personaTitle}</h1>

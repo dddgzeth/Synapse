@@ -41,7 +41,7 @@ export default function SceneDetailPage() {
 
   return (
     <main style={pageWrap}>
-      <Link href="/" style={backLink}>{t.common.backToChat}</Link>
+      <Link href="/app" style={backLink}>{t.common.backToChat}</Link>
 
       <header style={{ marginBottom: 18 }}>
         <div style={eyebrow}>{t.details.sceneEyebrow}</div>

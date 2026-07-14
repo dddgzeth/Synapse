@@ -137,7 +137,7 @@ export function LoginPanel() {
   const searchParams = useSearchParams();
   const { status } = useSession();
 
-  const callbackUrl = searchParams.get("callbackUrl") || "/";
+  const callbackUrl = searchParams.get("callbackUrl") || "/app";
 
   const [step, setStep] = useState<Step>("email");
   const [email, setEmail] = useState("");

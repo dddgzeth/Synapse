@@ -10,7 +10,7 @@
 
 import crypto from "node:crypto";
 import { generateText } from "ai";
-import { createOpenAI } from "@ai-sdk/openai";
+import { getLLMProvider } from "@/lib/llm/provider";
 import {
   getPipelineState,
   setPipelineState,
@@ -62,6 +62,8 @@ export interface TrajectoryNode {
   recordedAt: string;     // ISO timestamp
   type: string;           // claim / method / observation / ...
   snippet: string;        // ≤ 140 chars excerpt for the timeline UI
+  /** One-line LLM reasoning: why this memory supports the insight. */
+  why?: string;
 }
 
 /**
@@ -97,6 +99,8 @@ export interface AhaPending {
   supportingMemoryIds: string[];
   externalSources: ExternalSource[];
   detectedAt: string;
+  /** Detector stats captured at generation time — for tuning/audit. */
+  metrics?: { sceneCount?: number; spanDays: number; memoryCount: number };
 }
 
 export interface AhaHistoryEntry {
@@ -239,12 +243,10 @@ export function shouldFireAhaFallback(userText: string, aha: AhaPending): boolea
  * Budget: ~1s extra per chat when aha_pending exists. ~0 otherwise (early return).
  */
 export async function shouldFireAhaLLM(userText: string, aha: AhaPending): Promise<boolean> {
-  const rawBase = process.env.ANTHROPIC_BASE_URL ?? "https://www.fucheers.top";
-  const baseURL = rawBase.endsWith("/v1") ? rawBase : `${rawBase.replace(/\/$/, "")}/v1`;
-  const provider = createOpenAI({ baseURL, apiKey: process.env.ANTHROPIC_API_KEY ?? "" });
+  const provider = getLLMProvider();
   try {
     const result = await generateText({
-      model: provider.chat(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6"),
+      model: provider.createModel(),
       system: `你是相关性判官。判断【用户当前问题】是否与【待推送的洞察】话题相关。
 只回答一个字：YES 或 NO。
 
@@ -288,11 +290,19 @@ export async function runAhaDetection(userId: string): Promise<void> {
   const lang = getUserLang(userId);
 
   // 1. Theme — its own LLM detector already enforces "found=false" for noise.
+  //    Hard gate on top: a "recurring theme" must actually recur — ≥2 scenes
+  //    AND ≥2 weeks of span. Below that it's coincidence, not a pattern, and
+  //    surfacing it burns the user's trust in the feature.
   try {
     const theme = await detectThemeCandidateForUser(userId);
     if (theme) {
-      const aha = await generateAhaFromTheme(theme, { force: false, lang });
-      if (aha) { persistAha(userId, aha); return; }
+      const span = spanDaysOf(theme.memories);
+      if (theme.scenes.length < 2 || span < MIN_THEME_SPAN_DAYS) {
+        console.log(`[aha] theme gated out: scenes=${theme.scenes.length} spanDays=${span} (need ≥2 scenes, ≥${MIN_THEME_SPAN_DAYS}d)`);
+      } else {
+        const aha = await generateAhaFromTheme(theme, { force: false, lang });
+        if (aha) { persistAha(userId, aha); return; }
+      }
     }
   } catch (err) {
     console.warn("[aha] theme detection threw:", err);
@@ -317,6 +327,43 @@ function persistAha(userId: string, aha: AhaPending): void {
   appendAhaHistory(userId, aha.id, aha.detectedAt, serialized);
 }
 
+// Passive theme gate: a theme must span at least this many days to surface.
+const MIN_THEME_SPAN_DAYS = 14;
+
+// Appended to every generator system prompt — asks for a per-memory reasoning
+// line so the evidence drawer can show WHY each memory supports the insight.
+const EVIDENCE_SUFFIX_ZH = `
+
+补充要求：JSON 里额外加一个字段
+"evidence": [{"i": <上面记忆列表的序号>, "why": "<一句话：这条记忆为什么支撑该结论，说人话>"}]
+覆盖你真正引用的 2-6 条记忆即可，不要为凑数全列。`;
+const EVIDENCE_SUFFIX_EN = `
+
+Additional requirement: include one more JSON field
+"evidence": [{"i": <index from the numbered memory list>, "why": "<one plain sentence: why this memory supports the conclusion>"}]
+Cover only the 2-6 memories you actually drew on.`;
+
+/** Days between oldest and newest memory in a set. */
+function spanDaysOf(memories: Array<{ createdAt: string }>): number {
+  const ts = memories.map((m) => Date.parse(m.createdAt)).filter(Number.isFinite);
+  if (ts.length < 2) return 0;
+  return Math.round((Math.max(...ts) - Math.min(...ts)) / 86_400_000);
+}
+
+/** Attach per-memory `why` lines onto trajectory nodes (1-based indexes). */
+function applyEvidenceWhy(
+  trajectory: TrajectoryNode[],
+  evidence: Array<{ i?: number; why?: string }> | undefined,
+): void {
+  if (!Array.isArray(evidence)) return;
+  for (const e of evidence) {
+    if (typeof e?.i === "number" && typeof e?.why === "string" && e.why.trim()) {
+      const node = trajectory[e.i - 1];
+      if (node) node.why = e.why.trim();
+    }
+  }
+}
+
 /**
  * Generate an Aha card from one thread. The LLM sees an explicit chronological
  * sequence (`[date] (type) content`) and must:
@@ -332,25 +379,21 @@ async function generateAhaFromThread(
   thread: MemoryThread,
   opts: { force: boolean; lang?: "en" | "zh" },
 ): Promise<AhaPending | null> {
-  const rawBase = process.env.ANTHROPIC_BASE_URL ?? "https://www.fucheers.top";
-  const baseURL = rawBase.endsWith("/v1") ? rawBase : `${rawBase.replace(/\/$/, "")}/v1`;
-  const provider = createOpenAI({
-    baseURL,
-    apiKey: process.env.ANTHROPIC_API_KEY ?? "",
-  });
+  const provider = getLLMProvider();
 
   const lang = opts.lang ?? "zh";
   const timeline = formatThreadForPrompt(thread);
-  const system = opts.force
+  const system = (opts.force
     ? (lang === "en" ? FORCE_SYSTEM_PROMPT_EN : FORCE_SYSTEM_PROMPT)
-    : (lang === "en" ? PASSIVE_SYSTEM_PROMPT_EN : PASSIVE_SYSTEM_PROMPT);
+    : (lang === "en" ? PASSIVE_SYSTEM_PROMPT_EN : PASSIVE_SYSTEM_PROMPT))
+    + (lang === "en" ? EVIDENCE_SUFFIX_EN : EVIDENCE_SUFFIX_ZH);
 
   const prompt = lang === "en"
     ? `The following is the user's research trajectory on the topic "${thread.sceneName}" (chronological order):\n\n${timeline}\n\nOutput JSON per system instructions.`
     : `以下是用户在"${thread.sceneName}"这个话题下的研究轨迹（按时间升序）：\n\n${timeline}\n\n请按 system 指令输出 JSON。`;
 
   const result = await generateText({
-    model: provider.chat(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6"),
+    model: provider.createModel(),
     system,
     prompt,
     abortSignal: AbortSignal.timeout(30_000),
@@ -379,6 +422,7 @@ async function generateAhaFromThread(
     type: m.type,
     snippet: m.content.length > 140 ? m.content.slice(0, 140) + "…" : m.content,
   }));
+  applyEvidenceWhy(trajectory, parsed.evidence);
 
   return {
     id: `aha_${crypto.randomBytes(5).toString("hex")}`,
@@ -392,6 +436,7 @@ async function generateAhaFromThread(
     supportingMemoryIds: thread.memories.map((m) => m.id),
     externalSources,
     detectedAt: new Date().toISOString(),
+    metrics: { spanDays: spanDaysOf(thread.memories), memoryCount: thread.memories.length },
   };
 }
 
@@ -409,28 +454,24 @@ async function generateAhaFromTheme(
   theme: MemoryTheme,
   opts: { force: boolean; lang?: "en" | "zh" },
 ): Promise<AhaPending | null> {
-  const rawBase = process.env.ANTHROPIC_BASE_URL ?? "https://www.fucheers.top";
-  const baseURL = rawBase.endsWith("/v1") ? rawBase : `${rawBase.replace(/\/$/, "")}/v1`;
-  const provider = createOpenAI({
-    baseURL,
-    apiKey: process.env.ANTHROPIC_API_KEY ?? "",
-  });
+  const provider = getLLMProvider();
 
   const lang = opts.lang ?? "zh";
   const themePrompt = formatThemeForPrompt(theme);
-  const system = lang === "en" ? THEME_SYSTEM_PROMPT_EN : THEME_SYSTEM_PROMPT;
+  const system = (lang === "en" ? THEME_SYSTEM_PROMPT_EN : THEME_SYSTEM_PROMPT)
+    + (lang === "en" ? EVIDENCE_SUFFIX_EN : EVIDENCE_SUFFIX_ZH);
   const prompt = lang === "en"
     ? `A cross-cutting theme has been detected:\n\n${themePrompt}\n\nOutput JSON per system instructions.`
     : `检测到一个横切主题：\n\n${themePrompt}\n\n按 system 指令输出 JSON。`;
 
   const result = await generateText({
-    model: provider.chat(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6"),
+    model: provider.createModel(),
     system,
     prompt,
     abortSignal: AbortSignal.timeout(30_000),
   });
 
-  let parsed: { pattern?: string; observation?: string; hypothesis?: string; reframe?: string };
+  let parsed: { pattern?: string; observation?: string; hypothesis?: string; reframe?: string; evidence?: Array<{ i?: number; why?: string }> };
   try {
     const cleaned = result.text.replace(/^```json\s*/i, "").replace(/```\s*$/, "").trim();
     parsed = JSON.parse(cleaned);
@@ -455,6 +496,7 @@ async function generateAhaFromTheme(
     type: m.type,
     snippet: m.content.length > 140 ? m.content.slice(0, 140) + "…" : m.content,
   }));
+  applyEvidenceWhy(trajectory, parsed.evidence);
 
   return {
     id: `aha_${crypto.randomBytes(5).toString("hex")}`,
@@ -468,6 +510,11 @@ async function generateAhaFromTheme(
     themeScenes: theme.scenes,
     themeReasoning: theme.reasoning,
     supportingMemoryIds: theme.memories.map((m) => m.id),
+    metrics: {
+      sceneCount: theme.scenes.length,
+      spanDays: spanDaysOf(theme.memories),
+      memoryCount: theme.memories.length,
+    },
     externalSources,
     detectedAt: new Date().toISOString(),
   };
@@ -564,6 +611,8 @@ interface ThreadGenResult {
   observation?: string;
   hypothesis?: string;
   reframe?: string;
+  /** Per-memory reasoning, indexes refer to the numbered prompt list (1-based). */
+  evidence?: Array<{ i?: number; why?: string }>;
 }
 
 const PASSIVE_SYSTEM_PROMPT = `你是用户研究轨迹的观察者。给你的是用户在某一个话题下按时间排序的记忆序列。你的工作：判断这段记录是不是真的有一条"用户自己可能没意识到的演变线索"，只有真的有的时候才输出洞察。
@@ -641,12 +690,10 @@ async function fetchExternalSourcesForAha(
 }
 
 async function extractEnglishKeywordQuery(pattern: string, observation: string): Promise<string> {
-  const rawBase = process.env.ANTHROPIC_BASE_URL ?? "https://www.fucheers.top";
-  const baseURL = rawBase.endsWith("/v1") ? rawBase : `${rawBase.replace(/\/$/, "")}/v1`;
-  const provider = createOpenAI({ baseURL, apiKey: process.env.ANTHROPIC_API_KEY ?? "" });
+  const provider = getLLMProvider();
   try {
     const result = await generateText({
-      model: provider.chat(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6"),
+      model: provider.createModel(),
       system: `You distill a research-pattern description into a short English keyword query
 suitable for Semantic Scholar / arXiv. Output 3-6 English keywords separated by
 spaces. No commas, no quotes, no full sentences, no explanation. Only the query.`,

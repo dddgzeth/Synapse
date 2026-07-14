@@ -62,6 +62,8 @@ export interface TrajectoryNode {
   recordedAt: string;
   type: string;
   snippet: string;
+  /** One-line LLM reasoning: why this memory supports the insight. */
+  why?: string;
 }
 
 export type AhaKind = "trajectory" | "theme";
@@ -117,7 +119,7 @@ export interface EvidenceData {
 export type SelectedDetail =
   | { kind: "top"; aha: AhaPayload }
   | { kind: "scene"; scene: ScenePayload | { filename: null; title: string; summary: string; memoryCount: number; maxPriority: number; heat: number } }
-  | { kind: "memory"; memory: MemoryPayload; conversations: ConversationPayload[]; sceneAccent: string };
+  | { kind: "memory"; memory: MemoryPayload; conversations: ConversationPayload[]; sceneAccent: string; why?: string };
 
 interface Props {
   aha: AhaPayload;
@@ -610,6 +612,7 @@ function buildGraph(
               memory: m,
               conversations: convs,
               sceneAccent: accent.stripe,
+              why: (aha.trajectory ?? []).find((tr) => tr.memoryId === m.id)?.why,
             }),
         } satisfies MemoryNodeData as unknown as Record<string, unknown>,
       });

@@ -11,7 +11,9 @@ import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import Database from "better-sqlite3";
+import * as sqliteVec from "sqlite-vec";
 import type { MemoryRecord } from "../tencentdb/record/l1-writer";
+import { parseExtSessionKey } from "./user-scope";
 
 let _db: Database.Database | null = null;
 
@@ -26,6 +28,31 @@ export function getDb(): Database.Database {
 
   db.exec("PRAGMA journal_mode=WAL");
   db.exec("PRAGMA foreign_keys=ON");
+
+  // sqlite-vec — vector distance functions for hybrid (semantic) search.
+  // Load failure is survivable: vec search helpers detect and return [].
+  let vecLoaded = false;
+  try {
+    sqliteVec.load(db);
+    vecLoaded = true;
+  } catch (err) {
+    console.error("[store] sqlite-vec load failed — semantic search disabled:", err);
+  }
+
+  // ── Embeddings (bge-m3, dim 1024, f32 BLOB). Plain tables + brute-force
+  //    vec_distance_cosine: at single-user scale (10³–10⁴ rows) this is
+  //    millisecond-level and far simpler than vec0 virtual tables. ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS l0_embeddings (
+      record_id TEXT PRIMARY KEY,
+      embedding BLOB NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS l1_embeddings (
+      record_id TEXT PRIMARY KEY,
+      embedding BLOB NOT NULL
+    );
+  `);
+  (db as unknown as { __vecLoaded?: boolean }).__vecLoaded = vecLoaded;
 
   // ── L0: raw conversations ──
   db.exec(`
@@ -132,6 +159,18 @@ export function getDb(): Database.Database {
       key TEXT PRIMARY KEY,
       value TEXT NOT NULL
     );
+  `);
+
+  // ── API tokens (MCP / external clients). Plaintext never stored. ──
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS api_tokens (
+      token_hash   TEXT PRIMARY KEY,
+      user_id      TEXT NOT NULL,
+      label        TEXT NOT NULL DEFAULT '',
+      created_at   TEXT NOT NULL,
+      last_used_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id);
   `);
 
   // ── Aha history (every detected Aha is appended; nothing is overwritten) ──
@@ -328,6 +367,11 @@ export function insertL0(msg: L0Message): void {
       (record_id, session_key, session_id, role, message_text, recorded_at, timestamp)
     VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(msg.record_id, msg.session_key, msg.session_id, msg.role, msg.message_text, msg.recorded_at, msg.timestamp);
+  // Semantic index — off the critical path. Dynamic import breaks the
+  // store ↔ embed-queue cycle (embed-queue statically imports this module).
+  void import("./embed-queue")
+    .then((m) => m.queueEmbedL0(msg.record_id, msg.message_text))
+    .catch(() => {});
 }
 
 export function queryL0ForSession(sessionKey: string, limit = 100): L0Message[] {
@@ -488,7 +532,10 @@ export function listSessionsForUser(sessionKeyPrefix: string, limit = 50): Sessi
        WHERE session_key = c.session_key AND role = 'user'
        ORDER BY recorded_at ASC LIMIT 1) AS first_user_msg
     FROM l0_conversations c
-    WHERE session_key = ? OR session_key LIKE ?
+    WHERE (session_key = ? OR session_key LIKE ?)
+      -- Exclude external-tool sessions (Claude Code/Codex/etc via MCP); those
+      -- are shown separately under "Connected Tools", not the chat list.
+      AND instr(session_key, '_ext_') = 0
     GROUP BY session_key
     ORDER BY last_at DESC
     LIMIT ?
@@ -516,6 +563,74 @@ function deriveSessionTitle(firstUserMsg: string | null): string {
     .trim();
   if (!cleaned) return "New chat";
   return cleaned.length > 40 ? cleaned.slice(0, 40) + "…" : cleaned;
+}
+
+// ── External-tool sessions (MCP: Claude Code / Codex / Cursor …) ──────
+// These live in L0 under `chat_<uid>_ext_<source>_<project>` and are shown in
+// the sidebar's "Connected Tools" tree, separate from web chats.
+
+export interface ExternalSessionEntry {
+  sessionId: string;
+  title: string;
+  messageCount: number;
+  lastActive: string;
+}
+export interface ExternalSourceGroup {
+  source: string;
+  project: string;
+  sessions: ExternalSessionEntry[];
+}
+
+/** All of a user's external sessions, grouped source → project → sessions. */
+export function listExternalSessions(userPrefix: string, limit = 300): ExternalSourceGroup[] {
+  const rows = getDb().prepare(`
+    SELECT session_key, session_id,
+      MAX(recorded_at) AS last_at,
+      COUNT(*) AS msg_count,
+      (SELECT message_text FROM l0_conversations
+        WHERE session_key = c.session_key AND session_id = c.session_id AND role = 'user'
+        ORDER BY recorded_at ASC LIMIT 1) AS first_user_msg
+    FROM l0_conversations c
+    WHERE (session_key = ? OR session_key LIKE ?)
+      AND instr(session_key, '_ext_') > 0
+    GROUP BY session_key, session_id
+    ORDER BY last_at DESC
+    LIMIT ?
+  `).all(userPrefix, `${userPrefix}_%`, limit) as Array<{
+    session_key: string; session_id: string; last_at: string; msg_count: number; first_user_msg: string | null;
+  }>;
+
+  const groups = new Map<string, ExternalSourceGroup>();
+  for (const r of rows) {
+    const parsed = parseExtSessionKey(r.session_key);
+    if (!parsed) continue;
+    const key = `${parsed.source}///${parsed.project}`;
+    let g = groups.get(key);
+    if (!g) { g = { source: parsed.source, project: parsed.project, sessions: [] }; groups.set(key, g); }
+    g.sessions.push({
+      sessionId: r.session_id,
+      title: deriveSessionTitle(r.first_user_msg),
+      messageCount: r.msg_count,
+      lastActive: r.last_at,
+    });
+  }
+  return [...groups.values()];
+}
+
+/** Full L0 for one external (source, project[, sessionId]) — read-only browser. */
+export function queryL0ForExternalSession(
+  userPrefix: string, source: string, project: string,
+  sessionId?: string, limit = 300, offset = 0,
+): L0Message[] {
+  const sessionKey = project
+    ? `${userPrefix}_ext_${source}_${project}`
+    : `${userPrefix}_ext_${source}`;
+  const params: unknown[] = [sessionKey];
+  let sql = "SELECT * FROM l0_conversations WHERE session_key = ?";
+  if (sessionId) { sql += " AND session_id = ?"; params.push(sessionId); }
+  sql += " ORDER BY recorded_at ASC LIMIT ? OFFSET ?";
+  params.push(limit, offset);
+  return getDb().prepare(sql).all(...params) as L0Message[];
 }
 
 /**
@@ -575,6 +690,9 @@ export function upsertL1(record: MemoryRecord): void {
     JSON.stringify(record.metadata),
     record.createdAt, record.updatedAt,
   );
+  void import("./embed-queue")
+    .then((m) => m.queueEmbedL1(record.id, record.content))
+    .catch(() => {});
 }
 
 export function deleteL1(recordId: string): void {
@@ -834,4 +952,94 @@ function rowToMemoryRecord(row: any): MemoryRecord {
     sessionKey: row.session_key,
     sessionId: row.session_id,
   };
+}
+
+// ─────────────────────────────────────────────────────────────
+// Vector search (sqlite-vec, bge-m3 f32[1024] BLOBs)
+//
+// Write path: chat/pipeline code calls upsert*Embedding fire-and-forget
+// after computing the vector (see lib/memory/embed-queue.ts). Read path:
+// hybrid search (lib/memory/hybrid.ts) merges these with FTS via RRF.
+// ─────────────────────────────────────────────────────────────
+
+function vecAvailable(db: Database.Database): boolean {
+  return !!(db as unknown as { __vecLoaded?: boolean }).__vecLoaded;
+}
+
+export function upsertL0Embedding(recordId: string, embedding: Buffer): void {
+  getDb().prepare(
+    "INSERT OR REPLACE INTO l0_embeddings (record_id, embedding) VALUES (?, ?)",
+  ).run(recordId, embedding);
+}
+
+export function upsertL1Embedding(recordId: string, embedding: Buffer): void {
+  getDb().prepare(
+    "INSERT OR REPLACE INTO l1_embeddings (record_id, embedding) VALUES (?, ?)",
+  ).run(recordId, embedding);
+}
+
+export function searchL0VecForUser(queryVec: Buffer, sessionKeyPrefix: string, limit = 20): L0Message[] {
+  const db = getDb();
+  if (!vecAvailable(db)) return [];
+  try {
+    const rows = db.prepare(`
+      SELECT c.*, vec_distance_cosine(e.embedding, ?) AS dist
+      FROM l0_embeddings e
+      JOIN l0_conversations c ON c.record_id = e.record_id
+      WHERE c.session_key = ? OR c.session_key LIKE ?
+      ORDER BY dist ASC
+      LIMIT ?
+    `).all(queryVec, sessionKeyPrefix, `${sessionKeyPrefix}_%`, limit) as any[];
+    return rows as L0Message[];
+  } catch (err) {
+    console.error("[searchL0VecForUser] err=%s", (err as Error).message);
+    return [];
+  }
+}
+
+export function searchL1VecForUser(queryVec: Buffer, sessionKeyPrefix: string, limit = 20): MemoryRecord[] {
+  const db = getDb();
+  if (!vecAvailable(db)) return [];
+  try {
+    const rows = db.prepare(`
+      SELECT r.*, vec_distance_cosine(e.embedding, ?) AS dist
+      FROM l1_embeddings e
+      JOIN l1_records r ON r.record_id = e.record_id
+      WHERE r.session_key = ? OR r.session_key LIKE ?
+      ORDER BY dist ASC
+      LIMIT ?
+    `).all(queryVec, sessionKeyPrefix, `${sessionKeyPrefix}_%`, limit) as any[];
+    return rows.map(rowToMemoryRecord);
+  } catch (err) {
+    console.error("[searchL1VecForUser] err=%s", (err as Error).message);
+    return [];
+  }
+}
+
+/** Rows still lacking an embedding — backfill script feed. */
+export function listL0MissingEmbeddings(limit = 500): Array<{ record_id: string; message_text: string }> {
+  return getDb().prepare(`
+    SELECT c.record_id, c.message_text
+    FROM l0_conversations c
+    LEFT JOIN l0_embeddings e ON e.record_id = c.record_id
+    WHERE e.record_id IS NULL
+    LIMIT ?
+  `).all(limit) as Array<{ record_id: string; message_text: string }>;
+}
+
+export function listL1MissingEmbeddings(limit = 500): Array<{ record_id: string; content: string }> {
+  return getDb().prepare(`
+    SELECT r.record_id, r.content
+    FROM l1_records r
+    LEFT JOIN l1_embeddings e ON e.record_id = r.record_id
+    WHERE e.record_id IS NULL
+    LIMIT ?
+  `).all(limit) as Array<{ record_id: string; content: string }>;
+}
+
+export function countEmbeddings(): { l0: number; l1: number } {
+  const db = getDb();
+  const l0 = (db.prepare("SELECT COUNT(*) AS n FROM l0_embeddings").get() as any).n;
+  const l1 = (db.prepare("SELECT COUNT(*) AS n FROM l1_embeddings").get() as any).n;
+  return { l0, l1 };
 }

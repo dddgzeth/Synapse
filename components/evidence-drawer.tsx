@@ -101,7 +101,7 @@ function SceneDetail({ detail }: { detail: Extract<SelectedDetail, { kind: "scen
 
 function MemoryDetail({ detail }: { detail: Extract<SelectedDetail, { kind: "memory" }> }) {
   const { t, locale } = useI18n();
-  const { memory, conversations, sceneAccent } = detail;
+  const { memory, conversations, sceneAccent, why } = detail;
   return (
     <>
       {memory.scene_name && (
@@ -126,6 +126,22 @@ function MemoryDetail({ detail }: { detail: Extract<SelectedDetail, { kind: "mem
         <Stat label={t.aha.priority} value={`P${memory.priority}`} />
         <Stat label={t.aha.created} value={new Date(memory.createdAt).toLocaleDateString(locale)} />
       </div>
+
+      {why && (
+        <Section label={t.aha.whyEvidence}>
+          <div style={{
+            padding: "10px 12px",
+            background: "#FFF8F0",
+            border: "1px solid #F0DFC8",
+            borderRadius: 8,
+            color: "#7A5A10",
+            fontSize: 13.5,
+            lineHeight: 1.6,
+          }}>
+            {why}
+          </div>
+        </Section>
+      )}
 
       <Section label={t.details.l1Content}>
         <div style={{ whiteSpace: "pre-wrap", color: "#222" }}>{memory.content}</div>

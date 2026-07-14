@@ -10,7 +10,6 @@
  */
 
 import { NextRequest } from "next/server";
-import { createOpenAI } from "@ai-sdk/openai";
 import { streamText, generateText, convertToModelMessages, stepCountIs } from "ai";
 import crypto from "node:crypto";
 import { recallForQuery } from "@/lib/memory/recall";
@@ -22,11 +21,21 @@ import { getAhaPending, shouldFireAha, clearAhaPending } from "@/lib/memory/aha"
 import { buildChatTools } from "@/lib/memory/search-tools";
 import { buildSyncedFileTools, type SyncedFileEntry } from "@/lib/memory/synced-file-tools";
 import { runChatLoop, type Tools, type OpenAIMessage, type ChatLoopEvent } from "@/lib/memory/chat-loop";
+import { createLLMProviderFromOverride } from "@/lib/llm/provider";
 import { getCurrentSessionKey } from "@/lib/auth-session";
 import { getPipelineState, setPipelineState } from "@/lib/memory/store";
+import { saveDataUrlAttachment, saveAttachmentDescription, readAttachmentDescription, saveAttachmentHashIndex, findAttachmentByDataUrl } from "@/lib/attachments";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
+
+// fucheers rejects requests carrying both images and `tools`, so pasted images
+// are transcribed once by a dedicated vision call and enter the tool loop as
+// text. This prompt is that transcriber.
+const VISION_TRANSCRIBE_PROMPT = `你是图像转写器。把图片内容完整转写为文字，供后续对话与检索使用：
+1) 逐字转录图片中所有可读文字（OCR），保留原语言与排版顺序；
+2) 描述界面/图表/照片的结构、数据和关键视觉信息；
+3) 只输出转写内容本身，不要寒暄、不要评论、不要回答图片之外的问题。`;
 
 const BASE_SYSTEM_PROMPT = `你叫 **Synny**，是 Synapse 的吉祥物和对话化身——一个有长期记忆的工作助手。你帮助用户整理思路、分析信息、推进工作。
 你的回答简洁、精准，直接切入问题。
@@ -39,17 +48,18 @@ const BASE_SYSTEM_PROMPT = `你叫 **Synny**，是 Synapse 的吉祥物和对话
 如果下方"记忆上下文"区域有内容，请自然地融入回复，不要说"根据你的记忆"这类话——直接用内容本身作答。
 
 【你拥有的工具】
-- \`search_papers(query)\` — 搜索学术论文（Semantic Scholar）。返回标题、作者、DOI、PDF链接、TL;DR。**找论文、找代码仓库优先用这个**，比 web_search 更准确。
-- \`web_search(query)\` — 联网搜索（Tavily）。用于查找 GitHub 仓库、工具、博客等非论文资源。
+- \`search_papers(query)\` — 搜索学术论文（Semantic Scholar）。返回标题、作者、DOI、PDF链接、TL;DR。**找论文、找代码仓库优先用这个**，比 search_the_web 更准确。
+- \`search_the_web(query)\` — 联网搜索（Tavily）。用于查找 GitHub 仓库、工具、博客等非论文资源。
 - \`fetch_url(url)\` — 读取一个 URL 的页面内容。用于验证链接是否真实存在、读取 GitHub README、DOI 页面等。
 - \`tdai_memory_search(query, limit?, type?, scene?)\` — 搜索结构化长期记忆（L1）。**记忆是用户级全局的**，跨该用户所有对话累积。用于查"我做过什么/我的偏好/我的项目"。
 - \`tdai_conversation_search(query, limit?, sessionKey?)\` — 搜索原始对话历史（L0）。默认**跨该用户全部会话**。当用户明确指向"本次对话/这个 chat/this conversation"时，**必须传 \`sessionKey\` 参数**把范围缩窄到当前会话（见下方"当前会话"信息）。
+- \`view_image(attachment, question)\` — **重新查看用户发过的某张图片原图**并回答具体问题。对话里每张图都以 \`[用户发送的图片：att_….png]\` 块出现（附转写文本）；当转写不足以回答**视觉细节**（颜色/布局/数量/小字/图表数值/位置关系）时，用图块里的文件名调用本工具。不要凭转写猜视觉细节。
 - \`list_synced_files()\` — 列出本地同步文件夹的所有文件（仅元数据）。
 - \`read_synced_file(path)\` — 读一个文件的文本内容（pdf/docx/pptx/xlsx/纯文本均可）。
 
 【联网规则】
 - 给用户提 URL 之前，先用 \`fetch_url\` 验证它确实存在（HTTP 200）。
-- 不确定 GitHub 仓库地址时，先 \`web_search\` 找，再 \`fetch_url\` 确认，最后给用户。
+- 不确定 GitHub 仓库地址时，先 \`search_the_web\` 找，再 \`fetch_url\` 确认，最后给用户。
 
 【调用规则】
 - 工具调用请用 OpenAI 标准 \`tool_calls\` 字段，**不要**自己写 <tool_call>/<invoke> 这类伪 XML。
@@ -63,6 +73,7 @@ const BASE_SYSTEM_PROMPT = `你叫 **Synny**，是 Synapse 的吉祥物和对话
 5. 用户没说要读哪个文件、也没挂附件时，先 list 看一眼，然后请用户确认是否读全部或挑几个；**不要自作主张读所有文件**。`;
 
 interface ApiSettingsOverride {
+  provider?: string;
   apiKey?: string;
   baseUrl?: string;
   model?: string;
@@ -151,40 +162,134 @@ Reframe: ${ahaPending.reframe}
   // when the user clicks the Page toggle (POST /api/page-render).
 
 
-  const rawBase = apiSettings?.baseUrl?.trim() || process.env.ANTHROPIC_BASE_URL || "https://www.fucheers.top";
-  const baseURL = rawBase.endsWith("/v1") ? rawBase : `${rawBase.replace(/\/$/, "")}/v1`;
-  const apiKey = apiSettings?.apiKey?.trim() || process.env.ANTHROPIC_API_KEY || "";
-  const model = apiSettings?.model?.trim() || process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
-  const provider = createOpenAI({
-    baseURL,
-    apiKey,
-    // fucheers.top proxy only accepts Anthropic-style image blocks, not OpenAI's image_url.
-    // Rewrite the request body so vision attachments work, and force non-streaming for
-    // vision requests because the proxy strips images on streaming requests.
-    fetch: createProxyFetch(),
-  });
+  const provider = createLLMProviderFromOverride(apiSettings);
+  // Only fucheers can't take images + tools together → transcribe images to
+  // text before the tool loop. openai/anthropic send images directly.
+  const needsTranscription = !provider.capabilities.imagesWithTools;
 
   const hasImage = messageHasImage(lastUserMsg);
+  const turnStart = Date.now();
+
+  // ── Image turns: transcribe-then-loop ─────────────────────────────
+  // fucheers cannot take images and `tools` in one request (its gateway
+  // rejects with 「无法提取搜索关键词」). So pasted images never reach the
+  // tool loop directly: persist each image, run ONE vision call that
+  // transcribes it (OCR + structure), cache the transcript next to the
+  // attachment, then replace every image part with transcript text. Image
+  // turns then run the normal tool loop — web_search and friends included —
+  // and image content becomes searchable text for the memory pipeline.
+  let imgSuffix = "";
+  const freshTranscriptByUrl = new Map<string, string>();
+  let transcriptionFailed = false;
+  if (!isResumeAfterTool && hasImage) {
+    const freshParts = (lastUserMsg.parts ?? []).filter(
+      (p: any) => p.type === "file" && typeof p.url === "string" && p.url.startsWith("data:image/"),
+    ) as Array<{ type: string; url: string }>;
+
+    // Persist + hash-index + transcribe each image individually so every
+    // attachment gets its OWN cached transcript (multi-image turns used to
+    // share one combined blob under every name).
+    const saved: Array<{ name: string; url: string }> = [];
+    for (const part of freshParts) {
+      const name = saveDataUrlAttachment(userId, part.url);
+      if (!name) continue;
+      saveAttachmentHashIndex(userId, part.url, name);
+      saved.push({ name, url: part.url });
+      // Capable providers (openai/anthropic) receive the image directly in the
+      // tool loop — no need to transcribe. fucheers must transcribe.
+      if (!needsTranscription) continue;
+      try {
+        const gen = await generateText({
+          model: provider.createModel(),
+          system: VISION_TRANSCRIBE_PROMPT,
+          messages: [{
+            role: "user",
+            content: [
+              { type: "image" as const, image: part.url },
+              {
+                type: "text" as const,
+                text: userText.trim()
+                  ? `请按要求转写这张图片。用户随图提出的问题是：「${userText.trim().slice(0, 300)}」——转写时请特别详细地记录与该问题相关的内容。`
+                  : "请按要求转写这张图片。",
+              },
+            ],
+          }] as any,
+        });
+        const t = gen.text.trim();
+        if (t) {
+          saveAttachmentDescription(userId, name, t);
+          freshTranscriptByUrl.set(part.url, t);
+        } else {
+          transcriptionFailed = true;
+        }
+      } catch (err) {
+        transcriptionFailed = true;
+        console.error("[chat:vision] transcription failed:", err);
+      }
+    }
+
+    // L0 suffix: [img:name] markers re-render the image on history reload;
+    // the [img-desc] block puts the transcript INTO L0 so image content is
+    // FTS-searchable and visible to the L1 memory pipeline. The history route
+    // strips both markers from the visible bubble text.
+    imgSuffix = saved.length > 0
+      ? "\n\n" + saved.map((x) => `[img:${x.name}]`).join(" ")
+        + saved
+          .filter((x) => freshTranscriptByUrl.has(x.url))
+          .map((x) => `\n[img-desc]${freshTranscriptByUrl.get(x.url)}[/img-desc]`)
+          .join("")
+      : "\n\n[附件：1 张图片]";
+  }
+  if (transcriptionFailed) {
+    // User-visible failure notice — routed through the model since the
+    // transcription happens before the UI stream opens.
+    systemPrompt += `\n\n【注意】用户本轮发送的图片中有解析失败的：你只能看到成功解析的部分。回答开头请用一句话告知用户"有图片解析失败，仅基于文字和已解析内容回答"，然后正常回答。`;
+  }
+
+  // Replace every image part with its transcript so no image block ever hits
+  // fucheers alongside tools. Fresh parts (data URLs on the last user msg) use
+  // the transcript we just made; history parts (/api/attachment/<name>) use
+  // their cached one; anything else degrades to a placeholder.
+  //
+  // Skipped entirely for capable providers (openai/anthropic): they take the
+  // image blocks directly, so we leave the parts untouched.
+  if (needsTranscription) for (const m of messages) {
+    if (m.role !== "user" || !Array.isArray(m.parts)) continue;
+    m.parts = (m.parts as any[]).map((p) => {
+      if (p?.type !== "file" || typeof p.mediaType !== "string" || !p.mediaType.startsWith("image/")) {
+        return p;
+      }
+      let transcript: string | null = null;
+      let label = "图片";
+      if (typeof p.url === "string" && p.url.startsWith("/api/attachment/")) {
+        const name = decodeURIComponent(p.url.slice("/api/attachment/".length));
+        label = name;
+        transcript = readAttachmentDescription(userId, name);
+      } else if (typeof p.url === "string" && p.url.startsWith("data:image/")) {
+        // Fresh image on this turn, or an earlier same-session image still
+        // held as a data URL in the client's chat state — hash-index finds
+        // its stored attachment so we can reuse the cached transcript. Always
+        // resolve the attachment NAME too: the label is what lets the model
+        // call view_image on this exact file.
+        const name = findAttachmentByDataUrl(userId, p.url);
+        if (name) label = name;
+        transcript = freshTranscriptByUrl.get(p.url) ?? null;
+        if (!transcript && name) {
+          transcript = readAttachmentDescription(userId, name);
+        }
+      }
+      return {
+        type: "text",
+        text: `\n[用户发送的图片：${label}]\n${transcript ?? "（该图片暂无可用转写）"}\n[图片结束]\n`,
+      };
+    }) as typeof m.parts;
+  }
+
   // For the manual chat loop we need plain OpenAI-format messages, not ai-sdk
   // UIMessages. Use convertToModelMessages to get the right shape, then map to
   // strict OpenAI schema.
   const modelMessages = await convertToModelMessages(messages as any);
   const openaiMessages = toOpenAIMessages(modelMessages);
-
-  if (hasImage) {
-    const last = modelMessages[modelMessages.length - 1];
-    const lastOai = openaiMessages[openaiMessages.length - 1];
-    console.log("[chat:vision] hasImage=true. last modelMessage content:",
-      JSON.stringify(last?.content, (k, v) =>
-        typeof v === "string" && v.length > 120 ? `${v.slice(0, 80)}...[${v.length}b]` : v
-      ).slice(0, 1500));
-    console.log("[chat:vision] last openaiMessage content shape:",
-      typeof lastOai?.content === "string"
-        ? `string(${(lastOai.content as string).length})`
-        : Array.isArray(lastOai?.content)
-          ? `array[${lastOai!.content.length}] types=${(lastOai!.content as any[]).map((p) => p?.type).join(",")}`
-          : "unknown");
-  }
 
   // Persist the user message UP FRONT — before any tool loop or response path.
   //
@@ -198,7 +303,6 @@ Reframe: ${ahaPending.reframe}
   //
   // Inserting here, gated by !isResumeAfterTool, guarantees one persisted
   // copy regardless of which response path the request takes.
-  const turnStart = Date.now();
   if (!isResumeAfterTool) {
     try {
       insertL0({
@@ -206,7 +310,7 @@ Reframe: ${ahaPending.reframe}
         session_key: sessionKey,
         session_id: sessionId,
         role: "user",
-        message_text: userText + (hasImage ? "\n\n[附件：1 张图片]" : ""),
+        message_text: userText + imgSuffix,
         recorded_at: new Date(turnStart).toISOString(),
         timestamp: turnStart,
       } satisfies L0Message);
@@ -312,19 +416,11 @@ Reframe: ${ahaPending.reframe}
     ...buildSyncedFileTools(syncedFilesIndex, priorListPrefixes),
   } as unknown as Tools;
 
-  // 3a. Vision path — non-streaming (proxy strips images on streaming).
-  //     Vision-containing requests don't use tools; LLM just answers about the image.
-  if (hasImage) {
-    const gen = await generateText({
-      model: provider.chat(model),
-      system: systemPrompt,
-      messages: modelMessages,
-    });
-    await afterFinish(gen.text);
-    return uiStreamFromText(gen.text);
-  }
+  // Image turns run the same tool loop as everything else — see the
+  // transcribe-then-loop block above. (The old separate no-tools vision path
+  // is gone: fucheers can't mix images with tools, so we never send images.)
 
-  // 3b. Manual tool loop (non-streaming fucheers + UI message stream).
+  // Manual tool loop (non-streaming fucheers + UI message stream).
   //     fucheers proxy truncates tool_call arguments on streaming, so we can't
   //     use streamText. Loop until final text or until a client-side tool
   //     (read_synced_file) needs the browser; in that case pause and ship the
@@ -333,15 +429,11 @@ Reframe: ${ahaPending.reframe}
   //
   //     We stream UI message events progressively (tool-input-* + data-*)
   //     so the user sees what Synapse is doing in real time — like Grok / Claude.ai.
-  const baseFetch = createProxyFetch();
   return runChatStreaming({
     systemPrompt,
     openaiMessages,
     chatTools,
-    baseURL,
-    apiKey,
-    model,
-    fetchImpl: baseFetch,
+    provider,
     afterFinish,
     onToolCall: (name: string, input: unknown) => {
       if (name === "list_synced_files") {
@@ -363,10 +455,7 @@ function runChatStreaming(args: {
   systemPrompt: string;
   openaiMessages: OpenAIMessage[];
   chatTools: Tools;
-  baseURL: string;
-  apiKey: string;
-  model: string;
-  fetchImpl: typeof fetch;
+  provider: import("@/lib/llm/provider").LLMProvider;
   afterFinish: (text: string) => Promise<void>;
   onToolCall?: (name: string, input: unknown) => void;
 }): Response {
@@ -446,10 +535,7 @@ function runChatStreaming(args: {
           systemPrompt: args.systemPrompt,
           messages: args.openaiMessages,
           tools: args.chatTools,
-          baseURL: args.baseURL,
-          apiKey: args.apiKey,
-          model: args.model,
-          fetchImpl: args.fetchImpl,
+          provider: args.provider,
           onEvent,
         });
 
@@ -583,27 +669,34 @@ function extractUserContent(content: unknown): string | Array<{ type: string; [k
       .join("");
   }
 
-  // Build Anthropic-native image blocks directly — fucheers.top expects Anthropic
-  // format on its /v1/chat/completions endpoint (confirmed by vision test).
-  // Bypassing the image_url → image rewrite in createProxyFetch is simpler and
-  // more reliable than relying on the proxy intercept to fire correctly.
+  // Build standard OpenAI image_url blocks. fucheers accepts these natively
+  // (verified 2026-07: image_url data-URL → model reads the image, image
+  // tokens billed; Anthropic-style {type:"image"} blocks get stripped on the
+  // vision path and ERROR out on tool-loop requests — that was the
+  // "The model provider returned an error." bug after image turns).
+  const push = (parts: Array<{ type: string; [k: string]: unknown }>, url: string) => {
+    // Only forward data URLs; a stray relative path would make fucheers choke.
+    if (url.startsWith("data:") || /^https?:/.test(url)) {
+      parts.push({ type: "image_url", image_url: { url } });
+    }
+  };
   const parts: Array<{ type: string; [k: string]: unknown }> = [];
   for (const p of content as any[]) {
     if (!p || typeof p !== "object") continue;
     if (p.type === "text" && typeof p.text === "string" && p.text.length > 0) {
       parts.push({ type: "text", text: p.text });
     } else if (p.type === "image_url" && p.image_url?.url) {
-      parts.push(dataUrlToAnthropicBlock(p.image_url.url));
+      push(parts, p.image_url.url);
     } else if (p.type === "image") {
       const url = imagePartToDataUrl(p);
-      if (url) parts.push(dataUrlToAnthropicBlock(url));
+      if (url) push(parts, url);
     } else if (p.type === "file" && typeof p.mediaType === "string" && p.mediaType.startsWith("image/")) {
       // ai-sdk v6 `convertToModelMessages` keeps file parts with mediaType but
       // moves the payload to `data` (the original UI part had it on `url`).
       const url = typeof p.data === "string" ? p.data
         : typeof p.url === "string" ? p.url
         : "";
-      if (url) parts.push(dataUrlToAnthropicBlock(url));
+      if (url) push(parts, url);
     }
   }
   if (parts.length > 0) {
@@ -611,14 +704,6 @@ function extractUserContent(content: unknown): string | Array<{ type: string; [k
     console.log(`[chat:vision] user content parts built: ${types} (${parts.length} total)`);
   }
   return parts.length > 0 ? parts : "";
-}
-
-function dataUrlToAnthropicBlock(url: string): { type: string; [k: string]: unknown } {
-  const match = /^data:([^;]+);base64,(.+)$/.exec(url);
-  if (match) {
-    return { type: "image", source: { type: "base64", media_type: match[1], data: match[2] } };
-  }
-  return { type: "image", source: { type: "url", url } };
 }
 
 function imagePartToDataUrl(p: any): string {
@@ -709,52 +794,4 @@ function extractText(msg: { parts?: Array<{ type: string; text?: string }>; cont
       .join("");
   }
   return msg.content ?? "";
-}
-
-// Rewrite OpenAI-style image_url content blocks → Anthropic image blocks.
-// Returned as a factory so each request gets a fresh fetch (avoids stale closures).
-function createProxyFetch(): typeof fetch {
-  return async (input, init) => {
-    if (init?.body && typeof init.body === "string") {
-      try {
-        const parsed = JSON.parse(init.body);
-        let rewroteAnyImage = false;
-        if (Array.isArray(parsed.messages)) {
-          for (const m of parsed.messages) {
-            if (Array.isArray(m.content)) {
-              m.content = m.content.map((part: any) => {
-                if (part?.type === "image_url" && part.image_url?.url) {
-                  rewroteAnyImage = true;
-                  const url = part.image_url.url as string;
-                  const match = /^data:([^;]+);base64,(.+)$/.exec(url);
-                  if (match) {
-                    return {
-                      type: "image",
-                      source: { type: "base64", media_type: match[1], data: match[2] },
-                    };
-                  }
-                  return { type: "image", source: { type: "url", url } };
-                }
-                return part;
-              });
-            }
-          }
-        }
-        if (rewroteAnyImage) {
-          const lastUser = [...parsed.messages].reverse().find((m: any) => m.role === "user");
-          const types = Array.isArray(lastUser?.content)
-            ? lastUser.content.map((p: any) => p?.type).join(",")
-            : typeof lastUser?.content;
-          console.log(`[proxyFetch] rewrote image_url → image block. last user content types=${types}. url=${String(input).slice(0, 80)}`);
-        }
-        init = { ...init, body: JSON.stringify(parsed) };
-      } catch {
-        // body not JSON; pass through
-      }
-    }
-    const resp = await fetch(input as any, init as any);
-    // If the response was an error AND we had an image in the request, dump
-    // the upstream error body so we can see what fucheers complained about.
-    return resp;
-  };
 }

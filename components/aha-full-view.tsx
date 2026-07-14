@@ -116,7 +116,7 @@ export function AhaFullView({ id }: Props) {
         flexShrink: 0,
       }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <Link href="/" style={{
+          <Link href="/app" style={{
             display: "inline-flex", alignItems: "center", gap: 5,
             padding: "4px 9px", borderRadius: 6,
             border: "1px solid #D6A84F", background: "rgba(255,255,255,0.5)",

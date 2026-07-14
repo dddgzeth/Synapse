@@ -19,7 +19,7 @@
  */
 import path from "node:path";
 import { generateText } from "ai";
-import { createOpenAI } from "@ai-sdk/openai";
+import { getLLMProvider } from "@/lib/llm/provider";
 import { readSceneIndex } from "../../tencentdb/scene/scene-index";
 import { getUserDataDir, sessionKeyForUser } from "../user-scope";
 import { queryAllL1ForUser } from "../store";
@@ -175,9 +175,7 @@ function synthesizeSceneSummary(mems: MemoryRecord[]): string {
 async function proposeThemeFromScenes(
   scenes: SceneIndexEntry[],
 ): Promise<{ topic: string; scenes: string[]; reasoning: string } | null> {
-  const rawBase = process.env.ANTHROPIC_BASE_URL ?? "https://www.fucheers.top";
-  const baseURL = rawBase.endsWith("/v1") ? rawBase : `${rawBase.replace(/\/$/, "")}/v1`;
-  const provider = createOpenAI({ baseURL, apiKey: process.env.ANTHROPIC_API_KEY ?? "" });
+  const provider = getLLMProvider();
 
   const sceneList = scenes.map((s, i) => {
     const name = s.filename.replace(/\.md$/, "");
@@ -189,7 +187,7 @@ async function proposeThemeFromScenes(
   let usage: any;
   try {
     const res = await generateText({
-      model: provider.chat(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6"),
+      model: provider.createModel(),
       system: SYSTEM,
       prompt: `用户目前有以下 L2 场景及其摘要：
 
@@ -277,9 +275,10 @@ ${sceneList}
 
 /** Format a theme for the generation LLM. */
 export function formatThemeForPrompt(theme: MemoryTheme): string {
-  const memBlock = theme.memories.map((m) => {
+  // Numbered so the generator can cite evidence by index ("evidence": [{i, why}]).
+  const memBlock = theme.memories.map((m, i) => {
     const date = m.createdAt.slice(0, 10);
-    return `[${date}] (scene: ${m.scene_name}, ${m.type}) ${m.content}`;
+    return `${i + 1}. [${date}] (scene: ${m.scene_name}, ${m.type}) ${m.content}`;
   }).join("\n");
   return `Theme: ${theme.topic}
 Reasoning: ${theme.reasoning}

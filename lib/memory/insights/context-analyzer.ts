@@ -20,7 +20,7 @@
  */
 
 import { generateText } from "ai";
-import { createOpenAI } from "@ai-sdk/openai";
+import { getLLMProvider } from "@/lib/llm/provider";
 import type { MemoryRecord } from "../../tencentdb/record/l1-writer";
 
 /**
@@ -58,9 +58,7 @@ export async function analyzeRecallContext(
   const trimmed = userMessage.trim();
   if (trimmed.length < 4) return [];
 
-  const rawBase = process.env.ANTHROPIC_BASE_URL ?? "https://www.fucheers.top";
-  const baseURL = rawBase.endsWith("/v1") ? rawBase : `${rawBase.replace(/\/$/, "")}/v1`;
-  const provider = createOpenAI({ baseURL, apiKey: process.env.ANTHROPIC_API_KEY ?? "" });
+  const provider = getLLMProvider();
 
   // Truncate each candidate so the prompt stays bounded even when recall
   // returns long memories.
@@ -72,7 +70,7 @@ export async function analyzeRecallContext(
   let raw: string;
   try {
     const res = await generateText({
-      model: provider.chat(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6"),
+      model: provider.createModel(),
       system: SYSTEM,
       prompt: `用户当前消息：
 """

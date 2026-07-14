@@ -17,6 +17,10 @@ import {
   type L0Message,
 } from "./store";
 import { sessionKeyForUser } from "./user-scope";
+import { searchL0HybridForUser, searchL1HybridForUser } from "./hybrid";
+import { generateText } from "ai";
+import { getLLMProvider } from "@/lib/llm/provider";
+import { attachmentToDataUrl } from "../attachments";
 import type { MemoryRecord } from "../tencentdb/record/l1-writer";
 
 const TAG_CONV = "[synapse][tdai_conversation_search]";
@@ -59,7 +63,7 @@ export async function executeConversationSearch(params: {
   const candidateK = sessionFilter ? limit * 4 : limit * 2;
   let rows: L0Message[] = [];
   try {
-    rows = searchL0FtsForUser(query, userPrefix, candidateK);
+    rows = await searchL0HybridForUser(query, userPrefix, candidateK);
   } catch (err) {
     console.warn(`${TAG_CONV} FTS failed:`, err);
     return { results: [], total: 0, strategy: "none" };
@@ -147,7 +151,7 @@ export async function executeMemorySearch(params: {
   const candidateK = (typeFilter || sceneFilter) ? limit * 4 : limit * 2;
   let rows: MemoryRecord[] = [];
   try {
-    rows = searchL1FtsForUser(query, userPrefix, candidateK);
+    rows = await searchL1HybridForUser(query, userPrefix, candidateK);
   } catch (err) {
     console.warn(`${TAG_MEM} FTS failed:`, err);
     return { results: [], total: 0, strategy: "none" };
@@ -199,7 +203,7 @@ export function formatSearchResponse(result: MemorySearchResult): string {
 
 export async function executeWebSearch(query: string): Promise<string> {
   const apiKey = process.env.TAVILY_API_KEY;
-  if (!apiKey) return "web_search unavailable: TAVILY_API_KEY not configured.";
+  if (!apiKey) return "search_the_web unavailable: TAVILY_API_KEY not configured.";
   try {
     const resp = await fetch("https://api.tavily.com/search", {
       method: "POST",
@@ -295,6 +299,38 @@ export async function executeFetchUrl(url: string): Promise<string> {
 // ============================
 
 /**
+ * Re-inspect a stored image with a SPECIFIC question — the "look again"
+ * primitive that closes the gap with native-vision UX. The tool loop can't
+ * carry image blocks (fucheers rejects images+tools in one request), so the
+ * model calls this instead: one dedicated no-tools vision request against the
+ * stored original, conditioned on the exact question being asked.
+ */
+export async function executeViewImage(userId: string, attachment: string, question: string): Promise<string> {
+  const dataUrl = attachmentToDataUrl(userId, attachment);
+  if (!dataUrl) {
+    return `view_image error: attachment "${attachment}" not found. Use the exact name from the [用户发送的图片：att_….png] marker.`;
+  }
+  const provider = getLLMProvider();
+  try {
+    const gen = await generateText({
+      model: provider.createModel(),
+      system: "你是图像分析助手。仔细观察图片，针对用户的问题给出准确、具体的回答。看不清或图中没有的信息如实说明，不要编造。",
+      messages: [{
+        role: "user",
+        content: [
+          { type: "image", image: dataUrl },
+          { type: "text", text: question },
+        ],
+      }] as never,
+      abortSignal: AbortSignal.timeout(60_000),
+    });
+    return gen.text.trim() || "view_image: (empty response)";
+  } catch (err) {
+    return `view_image error: ${(err as Error).message}`;
+  }
+}
+
+/**
  * Returns the two tools as an `ai`-SDK-6 `tools` record, ready to pass into
  * `streamText({ tools, stopWhen: stepCountIs(N) })` / `generateText({ tools, ... })`.
  *
@@ -303,9 +339,13 @@ export async function executeFetchUrl(url: string): Promise<string> {
  */
 export function buildChatTools(userId: string) {
   return {
-    web_search: tool({
+    // NOTE: named `search_the_web`, NOT `web_search` — the fucheers proxy
+    // hijacks any tool literally named `web_search` with its own built-in
+    // search (returns SSE + "无法提取搜索关键词"), so our Tavily-backed tool
+    // never runs. The rename dodges that interception.
+    search_the_web: tool({
       description:
-        "Search the web via DuckDuckGo. Use when the user asks about external information, " +
+        "Search the web via Tavily. Use when the user asks about external information, " +
         "wants to find a GitHub repo, paper, tool, or any public resource. " +
         "Returns titles, URLs, and snippets. After searching, use fetch_url to read the actual page.",
       inputSchema: z.object({
@@ -329,11 +369,25 @@ export function buildChatTools(userId: string) {
       description:
         "Search academic papers on Semantic Scholar. Returns title, authors, year, DOI, open-access PDF link, and TL;DR. " +
         "Use when the user asks about research papers, wants to find a paper's DOI/PDF, or needs to find associated code repos. " +
-        "Better than web_search for academic queries. After finding a paper, use fetch_url on its DOI or GitHub link.",
+        "Better than search_the_web for academic queries. After finding a paper, use fetch_url on its DOI or GitHub link.",
       inputSchema: z.object({
         query: z.string().describe("Paper title, author name, or topic, e.g. 'MINERVA self-driving lab nanomaterials BAM'"),
       }),
       execute: async ({ query }) => executeSemanticScholarSearch(query),
+    }),
+
+    view_image: tool({
+      description:
+        "Look at one of the user's uploaded images AGAIN with a specific question. " +
+        "Every uploaded image appears in the conversation as a [用户发送的图片：att_….png] block " +
+        "containing a text transcript. When that transcript is NOT enough — visual details like " +
+        "colors, layout, counts, small text, chart values, spatial relations — call this with the " +
+        "attachment file name and a precise question. Returns a fresh vision analysis of the original image.",
+      inputSchema: z.object({
+        attachment: z.string().describe("Attachment file name from the image marker, e.g. 'att_1783704435668_ab12cd34.png'"),
+        question: z.string().describe("The specific visual question to answer, e.g. '表格第三行的数值是多少？' "),
+      }),
+      execute: async ({ attachment, question }) => executeViewImage(userId, attachment, question),
     }),
 
     tdai_conversation_search: tool({

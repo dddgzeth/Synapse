@@ -6,7 +6,7 @@
  */
 
 import { generateText } from "ai";
-import { createOpenAI } from "@ai-sdk/openai";
+import { getLLMProvider } from "@/lib/llm/provider";
 
 export interface StandaloneLLMConfig {
   baseUrl: string;
@@ -31,18 +31,10 @@ export class StandaloneLLMRunner {
   }): Promise<string> {
     const timeoutMs = params.timeoutMs ?? this.config.timeoutMs ?? 120_000;
 
-    const baseURL = this.config.baseUrl.endsWith("/v1")
-      ? this.config.baseUrl
-      : `${this.config.baseUrl.replace(/\/$/, "")}/v1`;
-    const provider = createOpenAI({
-      baseURL,
-      apiKey: this.config.apiKey,
-    });
-
     // No maxOutputTokens — let the model finish. Capping here used to chop
     // long L1/L2/L3 outputs mid-JSON, breaking the downstream parser.
     const result = await generateText({
-      model: provider.chat(this.config.model),
+      model: getLLMProvider().createModel(),
       system: params.systemPrompt,
       prompt: params.prompt,
       abortSignal: AbortSignal.timeout(timeoutMs),

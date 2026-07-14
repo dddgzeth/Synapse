@@ -15,6 +15,7 @@ import { collectSyncedFilesIndex } from "@/lib/synced-files";
 import { setSyncedFiles } from "@/lib/synced-files-bus";
 import type { FolderTreeNode } from "@/lib/synced-files-types";
 import { useI18n, type ApiSettings } from "./i18n";
+import { McpTokensModal } from "./mcp-tokens-modal";
 import { SynnyMascot } from "./synny-mascot";
 
 interface SceneBlock {
@@ -42,6 +43,10 @@ interface SearchHit {
   role: string;
   snippet: string;
   recordedAt: string;
+  sessionId?: string;
+  sourceLabel?: string;
+  source?: string;
+  project?: string;
 }
 
 interface ChatSession {
@@ -130,6 +135,8 @@ export function Sidebar() {
   const [searching, setSearching] = useState(false);
   const [refreshTick, setRefreshTick] = useState(0);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [toolSources, setToolSources] = useState<ToolSource[]>([]);
+  const [mcpOpen, setMcpOpen] = useState(false);
   const [activeSessionKey, setActiveSessionKey] = useState<string | null>(null);
   // Per-folder ephemeral scan progress: { [folderName]: discoveredFileCount }.
   // Lives in component state because it's transient and not part of SyncedFolder.
@@ -163,6 +170,11 @@ export function Sidebar() {
           setActiveSessionKey(d.defaultSessionKey);
         }
       })
+      .catch(() => {});
+    // Connected external tools (Claude Code / Codex / … via MCP).
+    fetch("/api/tools/status")
+      .then((r) => r.json())
+      .then((d) => setToolSources(d.sources ?? []))
       .catch(() => {});
   }, [refreshTick]);
 
@@ -415,10 +427,10 @@ export function Sidebar() {
     window.dispatchEvent(new CustomEvent("synapse:set-session", {
       detail: { sessionKey, ...(recordId ? { recordId } : {}) },
     }));
-    // If the user is on /persona, /scenes/..., /memories/..., go back to /
+    // If the user is on /persona, /scenes/..., /memories/..., go back to /app
     // so SynapseApp actually mounts and picks up the pending session.
-    if (pathname && pathname !== "/") {
-      router.push("/");
+    if (pathname && pathname !== "/app") {
+      router.push("/app");
     }
   }
 
@@ -615,7 +627,19 @@ export function Sidebar() {
                   hit={hit}
                   query={searchQuery}
                   onJump={() => {
-                    switchSession(hit.sessionKey, hit.recordId);
+                    // External-tool conversations are read-only archives — they
+                    // can't be continued in chat, so open the archive page and
+                    // scroll to the matched message instead of the chat panel.
+                    if (hit.source) {
+                      const qs = new URLSearchParams();
+                      if (hit.sessionId) qs.set("session", hit.sessionId);
+                      qs.set("record", hit.recordId);
+                      router.push(
+                        `/tools/${encodeURIComponent(hit.source)}/${encodeURIComponent(hit.project ?? "")}?${qs.toString()}`,
+                      );
+                    } else {
+                      switchSession(hit.sessionKey, hit.recordId);
+                    }
                     setSearchQuery("");
                   }}
                 />
@@ -652,6 +676,13 @@ export function Sidebar() {
                 </div>
               )}
             </div>
+          </Section>
+        )}
+
+        {/* Connected Tools — external MCP sources, never mixed into chats */}
+        {searchResults === null && (
+          <Section label={t.tools.connectedTools}>
+            <ConnectedTools sources={toolSources} onConnect={() => setMcpOpen(true)} />
           </Section>
         )}
 
@@ -742,6 +773,76 @@ export function Sidebar() {
         */}
       </div>
       <AccountCenter />
+      {mcpOpen && <McpTokensModal onClose={() => setMcpOpen(false)} />}
+    </div>
+  );
+}
+
+// ── Connected Tools tree: source → project → sessions (read-only browse) ──
+interface ToolProject {
+  project: string;
+  messageCount: number;
+  lastActive: string;
+  sessions: Array<{ sessionId: string; title: string; messageCount: number; lastActive: string }>;
+}
+interface ToolSource {
+  source: string;
+  projects: ToolProject[];
+}
+
+const TOOL_SOURCE_LABELS: Record<string, string> = {
+  "claude-code": "Claude Code", codex: "Codex", cursor: "Cursor", mcp: "MCP",
+};
+
+function ConnectedTools({ sources, onConnect }: { sources: ToolSource[]; onConnect: () => void }) {
+  const { t } = useI18n();
+  const router = useRouter();
+  return (
+    <div style={{ padding: "2px 8px 6px" }}>
+      {sources.length === 0 && (
+        <div style={{ padding: "4px 8px 8px", fontSize: 11.5, color: "var(--text-muted)", lineHeight: 1.5 }}>
+          {t.tools.emptyHint}
+        </div>
+      )}
+      {sources.map((s) => (
+        <div key={s.source} style={{ marginBottom: 4 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "5px 6px", fontSize: 12.5, fontWeight: 700 }}>
+            <span>📂</span><span>{TOOL_SOURCE_LABELS[s.source] ?? s.source}</span>
+          </div>
+          {s.projects.map((p) => (
+            <div key={p.project} style={{ marginLeft: 14 }}>
+              {p.project && (
+                <div style={{ padding: "3px 6px", fontSize: 12, color: "var(--text-muted)", fontWeight: 600 }}>{p.project}</div>
+              )}
+              {p.sessions.slice(0, 8).map((sess) => (
+                <button
+                  key={sess.sessionId}
+                  onClick={() => router.push(
+                    `/tools/${encodeURIComponent(s.source)}/${encodeURIComponent(p.project)}?session=${encodeURIComponent(sess.sessionId)}`,
+                  )}
+                  title={sess.title}
+                  style={{
+                    display: "block", width: "calc(100% - 14px)", marginLeft: 14, textAlign: "left",
+                    background: "transparent", border: "none", cursor: "pointer",
+                    padding: "4px 6px", borderRadius: 6, color: "var(--text)", fontSize: 12,
+                    overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                  }}
+                >
+                  {sess.title} <span style={{ color: "var(--text-muted)" }}>· {sess.messageCount}</span>
+                </button>
+              ))}
+            </div>
+          ))}
+        </div>
+      ))}
+      <button
+        onClick={onConnect}
+        style={{
+          width: "calc(100% - 12px)", margin: "6px 6px 0", padding: "6px 8px",
+          background: "transparent", border: "1px dashed var(--border)", borderRadius: 8,
+          color: "var(--accent)", cursor: "pointer", fontSize: 12, fontWeight: 600,
+        }}
+      >{t.tools.connectATool}</button>
     </div>
   );
 }
@@ -783,6 +884,12 @@ function SearchHitRow({
         }}>{hit.sessionTitle}</span>
         <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{dateStr}</span>
       </div>
+      {hit.sourceLabel && (
+        <div style={{
+          fontSize: 10, color: "var(--accent)", marginBottom: 3,
+          overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+        }}>↗ {hit.sourceLabel}</div>
+      )}
       <div style={{
         fontSize: 12, color: "var(--text)", lineHeight: 1.5,
         display: "-webkit-box", WebkitBoxOrient: "vertical", WebkitLineClamp: 2,
@@ -795,19 +902,32 @@ function SearchHitRow({
 }
 
 function highlightMatches(text: string, query: string): React.ReactNode {
-  const term = query.trim().split(/\s+/)[0];
-  if (!term) return text;
-  const lower = text.toLowerCase();
-  const needle = term.toLowerCase();
-  const idx = lower.indexOf(needle);
-  if (idx < 0) return text;
+  const phrase = query.trim();
+  if (!phrase) return text;
+  // Highlight the full phrase AND each word; longest first so the phrase wins
+  // over its own sub-words. One capture group ⇒ split yields matches at odd
+  // indices, with original casing preserved.
+  const needles = [...new Set([phrase, ...phrase.split(/\s+/)].filter(Boolean))]
+    .sort((a, b) => b.length - a.length)
+    .map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  let re: RegExp;
+  try {
+    re = new RegExp(`(${needles.join("|")})`, "gi");
+  } catch {
+    return text;
+  }
+  const segs = text.split(re);
   return (
     <>
-      {text.slice(0, idx)}
-      <mark style={{ background: "rgba(245,197,126,0.55)", color: "inherit", padding: 0 }}>
-        {text.slice(idx, idx + needle.length)}
-      </mark>
-      {text.slice(idx + needle.length)}
+      {segs.map((seg, i) =>
+        i % 2 === 1 ? (
+          <mark key={i} style={{ background: "rgba(245,197,126,0.55)", color: "inherit", padding: 0 }}>
+            {seg}
+          </mark>
+        ) : (
+          <span key={i}>{seg}</span>
+        ),
+      )}
     </>
   );
 }
@@ -1146,6 +1266,7 @@ function AccountCenter() {
   const { data: session } = useSession();
   const [open, setOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mcpOpen, setMcpOpen] = useState(false);
   const displayName = session?.user?.name || session?.user?.email || t.account.name;
   const displayEmail = session?.user?.email || t.account.plan;
   const avatarLetter = (displayName || displayEmail || "S").slice(0, 1).toUpperCase();
@@ -1187,6 +1308,14 @@ function AccountCenter() {
           >
             <span style={accountIconStyle}>🔑</span>
             <span style={{ flex: 1 }}>{t.account.apiSettings}</span>
+            <span style={{ color: "var(--text-muted)" }}>›</span>
+          </button>
+          <button
+            onClick={() => setMcpOpen(true)}
+            style={accountMenuButtonStyle}
+          >
+            <span style={accountIconStyle}>🔌</span>
+            <span style={{ flex: 1 }}>{t.account.mcpTools}</span>
             <span style={{ color: "var(--text-muted)" }}>›</span>
           </button>
           <div style={{ height: 1, background: "var(--border)", margin: "7px 4px" }} />
@@ -1240,6 +1369,7 @@ function AccountCenter() {
         <span style={{ color: "var(--text-muted)", fontSize: 14 }}>⌄</span>
       </button>
 
+      {mcpOpen && <McpTokensModal onClose={() => setMcpOpen(false)} />}
       {settingsOpen && (
         <ApiSettingsModal
           initial={apiSettings}
@@ -1325,6 +1455,22 @@ function ApiSettingsModal({
         </header>
 
         <div style={{ padding: 20, display: "grid", gap: 14 }}>
+          <label style={{ display: "grid", gap: 6 }}>
+            <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text-muted)" }}>{t.apiSettings.provider}</span>
+            <select
+              value={draft.provider ?? ""}
+              onChange={(e) => update("provider", e.target.value)}
+              style={{
+                padding: "9px 11px", borderRadius: 9, fontSize: 13,
+                border: "1px solid var(--border)", background: "var(--bg)", color: "var(--text)",
+              }}
+            >
+              <option value="">{t.apiSettings.providerDefault}</option>
+              <option value="fucheers">{t.apiSettings.providerFucheers}</option>
+              <option value="openai">{t.apiSettings.providerOpenai}</option>
+              <option value="anthropic">{t.apiSettings.providerAnthropic}</option>
+            </select>
+          </label>
           <SettingsField
             label={t.apiSettings.apiKey}
             value={draft.apiKey}
@@ -1354,7 +1500,7 @@ function ApiSettingsModal({
           borderTop: "1px solid var(--border)",
         }}>
           <button
-            onClick={() => setDraft({ apiKey: "", baseUrl: "", model: "" })}
+            onClick={() => setDraft({ provider: "", apiKey: "", baseUrl: "", model: "" })}
             style={{
               border: "none",
               background: "transparent",

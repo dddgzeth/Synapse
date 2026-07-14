@@ -124,6 +124,11 @@ export function ChatPanel({ sessionKey, onMemoryUpdate, scrollToRecordId, onScro
   const isAtBottomRef = useRef(true);
   const justSentRef = useRef(false);
   const isInitialLoadRef = useRef(true);
+  // Mirror scrollToRecordId so the auto-scroll effect can read it WITHOUT
+  // depending on it — otherwise resetting it to null (after a search jump)
+  // re-fires that effect and yanks the view to the bottom mid-jump.
+  const scrollTargetRef = useRef(scrollToRecordId);
+  scrollTargetRef.current = scrollToRecordId;
 
   const handleScrollContainer = useCallback(() => {
     const el = scrollContainerRef.current;
@@ -155,7 +160,7 @@ export function ChatPanel({ sessionKey, onMemoryUpdate, scrollToRecordId, onScro
     if (isInitialLoadRef.current) {
       // First batch of messages (history load or first reply) — snap instantly,
       // unless a specific record was requested (search jump handles its own scroll).
-      if (!scrollToRecordId) {
+      if (!scrollTargetRef.current) {
         bottomRef.current?.scrollIntoView({ behavior: "instant" });
       }
       isInitialLoadRef.current = false;
@@ -166,10 +171,11 @@ export function ChatPanel({ sessionKey, onMemoryUpdate, scrollToRecordId, onScro
       justSentRef.current = false;
       return;
     }
-    if (isAtBottomRef.current) {
+    // Don't chase the bottom while a search jump is in flight.
+    if (isAtBottomRef.current && !scrollTargetRef.current) {
       bottomRef.current?.scrollIntoView({ behavior: "smooth" });
     }
-  }, [messages, scrollToRecordId]);
+  }, [messages]);
 
   // Scroll to a specific message after history loads (search jump). Also flashes
   // the target so users see where they landed.

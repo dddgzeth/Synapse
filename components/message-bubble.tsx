@@ -360,6 +360,7 @@ export function MessageBubble({ message, streaming = false }: Props) {
   const { t, apiSettings } = useI18n();
   const isUser = message.role === "user";
   const [viewMode, setViewMode] = useState<"chat" | "page">("chat");
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   const fullText = extractText(message);
   // Artifact protocol is assistant-only output. Skipping it for user messages
   // means we can never accidentally strip part of a user's question because it
@@ -474,7 +475,7 @@ export function MessageBubble({ message, streaming = false }: Props) {
           <ProgressChips items={progress} clientTools={clientTools} streaming={streaming && !hasText} />
         )}
 
-        {/* Image attachments */}
+        {/* Image attachments — click to zoom */}
         {images.length > 0 && (
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
             {images.map((img, i) => (
@@ -482,13 +483,35 @@ export function MessageBubble({ message, streaming = false }: Props) {
                 key={i}
                 src={img.url}
                 alt={img.filename ?? "image"}
+                onClick={() => setLightboxUrl(img.url)}
                 style={{
                   maxWidth: 240, maxHeight: 240, borderRadius: 10,
                   border: "1px solid var(--border)", objectFit: "contain",
-                  background: "var(--surface-2)",
+                  background: "var(--surface-2)", cursor: "zoom-in",
                 }}
               />
             ))}
+          </div>
+        )}
+        {lightboxUrl && (
+          <div
+            onClick={() => setLightboxUrl(null)}
+            style={{
+              position: "fixed", inset: 0, zIndex: 1000,
+              background: "rgba(14,13,18,0.82)",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              cursor: "zoom-out", padding: 32,
+            }}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={lightboxUrl}
+              alt="attachment"
+              style={{
+                maxWidth: "92vw", maxHeight: "92vh", objectFit: "contain",
+                borderRadius: 12, boxShadow: "0 24px 80px rgba(0,0,0,0.5)",
+              }}
+            />
           </div>
         )}
 

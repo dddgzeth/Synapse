@@ -1,5 +1,5 @@
-import { SynapseApp } from "@/components/synapse-app";
+import { Landing } from "@/components/landing";
 
 export default function Home() {
-  return <SynapseApp />;
+  return <Landing />;
 }

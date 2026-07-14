@@ -24,7 +24,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { generateText, tool, stepCountIs } from "ai";
-import { createOpenAI } from "@ai-sdk/openai";
+import { getLLMProvider } from "@/lib/llm/provider";
 import { z } from "zod";
 import type { LLMRunParams, LLMRunner } from "./types";
 
@@ -64,13 +64,7 @@ export class CleanContextRunner implements LLMRunner {
   async run(params: LLMRunParams): Promise<string> {
     const timeoutMs = params.timeoutMs ?? 120_000;
 
-    const rawBase = process.env.ANTHROPIC_BASE_URL ?? "https://www.fucheers.top";
-    const baseURL = rawBase.endsWith("/v1") ? rawBase : `${rawBase.replace(/\/$/, "")}/v1`;
-    const provider = createOpenAI({
-      baseURL,
-      apiKey: process.env.ANTHROPIC_API_KEY ?? "",
-    });
-    const model = provider.chat(process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6");
+    const model = getLLMProvider().createModel();
 
     const tools = this.enableTools ? this.buildTools(params.workspaceDir) : undefined;
 

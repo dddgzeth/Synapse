@@ -17,9 +17,7 @@
     → 点 memory → 跳到对应 L2 scene → 跳到 L0 原文。AhaCard
     现在只渲染文本，没有展开链。
   ────────────────────────────────────────
-  Plan 条目: Aha Insight 融合外部文献（PLAN 286，externalSources）
-  严重度: 🟡 中
-  说明: 现在 generateAhaInsight 只看 L1，不调 miromind 取外部论文，输出 JSON 里
+ /1，不调 miromind 取外部论文，输出 JSON 里
     externalSources 字段是空的。
   ────────────────────────────────────────
   Plan 条目: Aha 触发逻辑用 LLM 判官（无硬编码阈值）

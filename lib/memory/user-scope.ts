@@ -45,6 +45,41 @@ export function sessionKeyForUser(userId: string): string {
 }
 
 /**
+ * External-tool session keys: `chat_<userId>_ext_<source>_<project>`.
+ *
+ * source/project are slugged to [a-z0-9-] (underscores stripped) so the
+ * `_ext_<source>_<project>` suffix parses unambiguously even though userIds
+ * themselves contain underscores. `project` is optional — omitting it yields
+ * the legacy two-level `chat_<userId>_ext_<source>` (kept for back-compat).
+ */
+function slug(s: string, max = 40): string {
+  // Keep unicode letters/digits (so Chinese project names survive), turn
+  // spaces/underscores into hyphens, drop everything else. NO underscores
+  // remain, which keeps the `_ext_<source>_<project>` suffix unambiguous.
+  return (s || "")
+    .toLowerCase()
+    .replace(/[_\s]+/g, "-")
+    .replace(/[^\p{L}\p{N}-]/gu, "")
+    .slice(0, max);
+}
+
+export function extSessionKeyForUser(userId: string, source: string, project?: string): string {
+  const src = slug(source) || "mcp";
+  const base = `${sessionKeyForUser(userId)}_ext_${src}`;
+  const proj = project ? slug(project) : "";
+  return proj ? `${base}_${proj}` : base;
+}
+
+/** Parse the `_ext_<source>_<project>` suffix. Returns null for non-ext keys. */
+export function parseExtSessionKey(sessionKey: string): { source: string; project: string } | null {
+  // source/project contain no underscores (slugged), so split on the last
+  // `_ext_` then on the single project separator.
+  const m = sessionKey.match(/_ext_([^_]+)(?:_([^_]+))?$/u);
+  if (!m) return null;
+  return { source: m[1], project: m[2] ?? "" };
+}
+
+/**
  * Per-user data directory. Creates the dir + the L2 scene_blocks/.metadata
  * subdirs on first use so callers don't need to mkdir themselves.
  */

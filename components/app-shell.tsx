@@ -14,12 +14,13 @@ import { AuthProvider } from "./auth-provider";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const isLogin = pathname === "/login";
+  // Public, full-screen pages with no app chrome: login + the marketing landing page.
+  const isBare = pathname === "/login" || pathname === "/";
 
   return (
     <AuthProvider>
       <I18nProvider>
-        {isLogin ? (
+        {isBare ? (
           children
         ) : (
           <div style={{ display: "flex", height: "100vh", overflow: "hidden" }}>
