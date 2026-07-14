@@ -236,9 +236,9 @@ const COPY: Record<Lang, {
           cta: "免费开始", ctaHref: "/app",
         },
         {
-          name: "专业版", price: "$12/月", tagline: "适合整天泡在 AI 里的重度用户。",
+          name: "专业版", price: "$0", tagline: "适合整天泡在 AI 里的重度用户。",
           features: ["包含免费版全部功能", "通过 MCP 连接每一个 AI 工具", "深度调研(Semantic Scholar + arXiv)", "按用量计费的 AI 算力,透明计价", "一键完整导出"],
-          cta: "升级专业版", ctaHref: "/app", highlight: true,
+          cta: "即刻免费体验", ctaHref: "/app", highlight: true,
         },
         {
           name: "团队版", price: "定制", tagline: "适合需要共享记忆层的实验室和团队。",
