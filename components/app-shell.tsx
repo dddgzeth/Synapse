@@ -11,11 +11,13 @@ import { Sidebar } from "./sidebar";
 import { DetailModal } from "./detail-modal";
 import { I18nProvider } from "./i18n";
 import { AuthProvider } from "./auth-provider";
+import { isBarePage } from "@/lib/public-pages";
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  // Public, full-screen pages with no app chrome: login + the marketing landing page.
-  const isBare = pathname === "/login" || pathname === "/";
+  // Public, full-screen pages with no app chrome: login + every bare public
+  // marketing page (see lib/public-pages.ts — shared with middleware.ts).
+  const isBare = pathname === "/login" || isBarePage(pathname ?? "");
 
   return (
     <AuthProvider>

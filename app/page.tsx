@@ -1,5 +1,5 @@
 import { Landing } from "@/components/landing";
 
 export default function Home() {
-  return <Landing />;
+  return <Landing lang="en" />;
 }

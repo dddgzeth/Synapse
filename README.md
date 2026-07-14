@@ -1,8 +1,8 @@
 # Synapse — Your Second Memory
 
-> An AI research assistant with long-term memory. Runs locally, stores locally. Every conversation accumulates into a traceable research profile.
+> An AI research assistant with long-term memory that follows you across every AI tool you use — the web chat, Claude Code, Codex, Cursor, anywhere. Every conversation accumulates into a traceable research profile.
 
-Chat with Synapse like you'd chat with any assistant — attach local folders, ask questions, get answers. In the background Synapse distils your conversations into structured memories (L0→L1→L2→L3). Occasionally, in the middle of a perfectly ordinary reply, it quietly surfaces: *"Synapse noticed — across 10 research threads over 9 days, the same unresolved question keeps converging…"* — not triggered by a button, but by the weight of accumulated evidence.
+Chat with Synapse like you'd chat with any assistant — attach local folders, ask questions, get answers. In the background Synapse distils your conversations into structured memories (L0→L1→L2→L3). Connect Claude Code, Codex, Cursor, or any MCP client with one pasted instruction, and their conversations sync back automatically too — one memory, not one memory per tool. Occasionally, in the middle of a perfectly ordinary reply, it quietly surfaces: *"Synapse noticed — across 10 research threads over 9 days, the same unresolved question keeps converging…"* — not triggered by a button, but by the weight of accumulated evidence.
 
 **[中文文档 → README.zh.md](README.zh.md)**
 
@@ -10,9 +10,9 @@ Chat with Synapse like you'd chat with any assistant — attach local folders, a
 
 ## Demo
 
-[![Demo Video](https://img.youtube.com/vi/3FjaOnHsJBY/maxresdefault.jpg)](https://www.youtube.com/watch?v=3FjaOnHsJBY)
+[![Demo Video](public/demo/demo-en-thumb.jpg)](https://synapse.cjlin.com/demo-en)
 
-▶ **[Watch the 72-second demo on YouTube](https://www.youtube.com/watch?v=3FjaOnHsJBY)**
+▶ **[Watch the 96-second demo](https://synapse.cjlin.com/demo-en)** · [中文配音版](https://synapse.cjlin.com/demo-zh)
 
 ---
 
@@ -63,11 +63,27 @@ npm run dev      # http://localhost:3000
 
 ### Environment Variables (`.env.local`)
 
+The app runs on the fucheers vars alone — openai / anthropic are opt-in only, never required.
+
 ```
-# Main chat + all L1/L2/L3 extraction + Aha synthesis
+# ── Chat/pipeline LLM backend ────────────────────────────
+LLM_PROVIDER=fucheers        # fucheers | openai | anthropic
+
+# fucheers (default, required for the app to run)
 ANTHROPIC_BASE_URL=https://your-claude-proxy/
 ANTHROPIC_API_KEY=sk-xxx
 ANTHROPIC_MODEL=claude-sonnet-4-6
+
+# openai (optional — only used when LLM_PROVIDER=openai or chosen in the UI)
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o
+
+# anthropic direct (optional — dedicated vars so they don't clash with the
+# fucheers-repurposed ANTHROPIC_* above)
+ANTHROPIC_DIRECT_API_KEY=
+ANTHROPIC_DIRECT_MODEL=claude-sonnet-4-6
+ANTHROPIC_DIRECT_BASE_URL=
 
 # Deep Research (user-initiated)
 MIROMIND_BASE_URL=https://api.miromind.ai/v1
@@ -86,7 +102,7 @@ TDAI_DATA_DIR=/path/to/your/synapse-data
 ┌─────────────────── Browser (Client) ────────────────────┐
 │                                                          │
 │  Sidebar           ChatPanel             AhaModal        │
-│  • Local folders   • useChat hook        • Evidence graph│
+│  • Connected Tools • useChat hook        • Evidence graph│
 │  • Insight history • Tool-call loop      • xyflow nodes  │
 │  • Memories/scenes • File attachments    • Draggable     │
 │                                                          │
@@ -105,6 +121,10 @@ TDAI_DATA_DIR=/path/to/your/synapse-data
 │  /api/memories       ── sidebar data (L0/L1/L2/L3)        │
 │  /api/scene/[name]   ── scene block detail                │
 │  /api/insight        ── Deep Research                     │
+│  /api/[transport]    ── MCP server (6 tools, PAT auth)    │
+│  /api/tools/*        ── Connected Tools + archive view     │
+│  /api/tokens         ── mint/revoke MCP access tokens     │
+│  /api/hook           ── serves the auto-capture script     │
 │                                                           │
 │  scheduler.notifyTurn  ─→  l1-pipeline                    │
 │        ↓ (≥5 turns or flush)       ↓ (≥3 new memories)   │
@@ -125,6 +145,8 @@ TDAI_DATA_DIR=/path/to/your/synapse-data
 │  • Semantic Scholar / arXiv ── Aha external literature    │
 └────────────────────────────────────────────────────────────┘
 ```
+
+External AI tools (Claude Code, Codex, Cursor, any MCP client) don't go through the browser at all — they hit `/api/[transport]` directly over MCP, and a Stop hook (`scripts/hooks/synapse_sync.py`, downloaded from `/api/hook`) posts the last finished turn to `log_conversation` once per turn. See [Connect Any AI Tool](#connect-any-ai-tool-mcp--auto-capture) below for the full flow.
 
 ---
 
@@ -193,6 +215,35 @@ Not "button → generate". The background scanner finds L1 memories where the sa
 
 ---
 
+## Connect Any AI Tool: MCP + Auto-Capture
+
+Synapse isn't only the web chat — it's a memory hub any MCP-capable AI tool can read from and write into. Claude Code, Codex, Cursor, or any other MCP client can be connected with **one pasted instruction**, no manual config editing.
+
+**Setup (from the account menu → Connect AI tools):**
+
+1. Generate a personal access token in the UI.
+2. Pick your tool; Synapse builds an install instruction tailored to that client's actual MCP config format and hook schema (Claude Code's `~/.claude/settings.json` Stop hook is not shaped like Codex's `[[hooks.Stop.hooks]]` TOML block — the adapter (`lib/mcp-adapters.ts`) knows the difference and never guesses).
+3. Paste the instruction into the tool's chat. It registers the MCP server and downloads a Stop-hook script (`scripts/hooks/synapse_sync.py`, served publicly at `/api/hook`) that fires once per turn.
+
+![Connect your AI tools modal](public/screenshots/mcp-connect-modal.jpg)
+
+**What happens after that:**
+
+The pasted instruction plays out as an ordinary conversation in the tool itself — it registers the MCP server, installs the hook, and confirms:
+
+![Claude Code auto-configuring after the instruction is pasted](public/screenshots/mcp-auto-capture.jpg)
+
+- Every finished turn in that tool gets synced to Synapse automatically — no "remember this" prompt required. The hook only ever sends the last user↔assistant exchange (never the whole session transcript), and it's a plain HTTP call from a local script — it never touches the AI tool's own model context or token usage.
+- Synced conversations live under their own session namespace (`chat_<user>_ext_<source>_<project>`) and show up in the sidebar's **Connected Tools** tree, grouped by tool → project → session — kept separate from your web chat history.
+- Clicking into one opens a **read-only archive** view (`/tools/[source]/[project]`) showing the full conversation exactly as it happened in that tool.
+- The MCP server also exposes tools the connected AI can call directly: `get_context`, `search_memory`, `search_conversations`, `remember`, `log_conversation`, `get_insights` — so Claude Code can, say, pull your research context into a coding session, or you can tell it "remember this" and have it land in the same memory the web chat reads from.
+
+![Connected Tools sidebar + read-only archive of a synced conversation](public/screenshots/mcp-connected-archive.jpg)
+
+**Search** is hybrid: local `bge-m3` embeddings (via `node-llama-cpp`, no external embedding API) combined with FTS5 through Reciprocal Rank Fusion, so exact keyword hits and paraphrased semantic matches both surface — and an exact phrase match is boosted to outrank a merely-similar neighbour.
+
+---
+
 ## File Sync: Metadata-only + LLM-initiated reads
 
 **Key constraint**: syncing a folder does **not** automatically push file contents into the database.
@@ -216,10 +267,11 @@ Only when the user has actually had the LLM read a file and discussed it does th
 | Layer | Choice | Notes |
 |---|---|---|
 | Framework | Next.js 14 (App Router) | RSC + Route Handlers |
-| Main LLM | `claude-sonnet-4-6` via OpenAI-compatible proxy | Streaming + tool_call bug worked around with manual loop in `lib/memory/chat-loop.ts` |
+| Main LLM | Provider-abstracted (`lib/llm/provider.ts`) | fucheers by default (`claude-sonnet-4-6`), openai/anthropic opt-in only — app runs on fucheers alone |
+| Cross-tool sync | Model Context Protocol (`@modelcontextprotocol/sdk`) | Per-client connect adapters + Stop-hook auto-capture, see [Connect Any AI Tool](#connect-any-ai-tool-mcp--auto-capture) |
 | Deep Research LLM | `mirothinker-1-7-deepresearch-mini` | User-initiated only |
-| AI SDK | Vercel `ai` v6 + `@ai-sdk/openai` v3 | `useChat` + `DefaultChatTransport` |
-| Database | `better-sqlite3` + FTS5 trigram | Supports Chinese full-text search |
+| AI SDK | Vercel `ai` v6 + `@ai-sdk/openai`/`@ai-sdk/anthropic` v3 | `useChat` + `DefaultChatTransport` |
+| Database + search | `better-sqlite3` + FTS5 trigram + `sqlite-vec` | Hybrid search: local `bge-m3` embeddings (`node-llama-cpp`) fused with FTS5 via RRF |
 | Graph viz | `@xyflow/react` v12 | Aha evidence graph |
 | PDF parsing | `pdfjs-dist` v5 | Browser-side, lazy loaded |
 | External search | Semantic Scholar API + arXiv API | Direct fetch, no SDK |

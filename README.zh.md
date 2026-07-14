@@ -1,8 +1,8 @@
 # Synapse — 你的第二记忆
 
-> 带长期记忆的研究助理 chatbot。本地跑、本地存，所有对话沉淀成可溯源的研究画像。
+> 带长期记忆的研究助理，记忆跟着你走，不管你在哪个 AI 工具里——网页对话、Claude Code、Codex、Cursor。所有对话都沉淀成可溯源的研究画像。
 
-像和普通助手聊天一样正常对话——挂载本地文件夹、提问、获得回答。Synapse 在后台把对话切成结构化记忆（L0→L1→L2→L3）。偶尔，在一次很平常的回复里，它会悄悄浮出一段话：*「Synapse 注意到——过去 9 天里，你在 10 个不同的研究线索里反复触碰同一个未解问题……」*——不是按钮触发的，是积累到一定厚度后被动出现的。
+像和普通助手聊天一样正常对话——挂载本地文件夹、提问、获得回答。Synapse 在后台把对话切成结构化记忆（L0→L1→L2→L3）。粘贴一段指令就能连上 Claude Code、Codex、Cursor 或任何 MCP 客户端，它们的对话也会自动同步回来——是一份记忆，不是每个工具各存各的。偶尔，在一次很平常的回复里，它会悄悄浮出一段话：*「Synapse 注意到——过去 9 天里，你在 10 个不同的研究线索里反复触碰同一个未解问题……」*——不是按钮触发的，是积累到一定厚度后被动出现的。
 
 **[English README → README.md](README.md)**
 
@@ -10,9 +10,9 @@
 
 ## Demo 视频
 
-[![Demo Video](https://img.youtube.com/vi/3FjaOnHsJBY/maxresdefault.jpg)](https://www.youtube.com/watch?v=3FjaOnHsJBY)
+[![Demo Video](public/demo/demo-zh-thumb.jpg)](https://synapse.cjlin.com/demo-zh)
 
-▶ **[在 YouTube 观看 72 秒产品 Demo](https://www.youtube.com/watch?v=3FjaOnHsJBY)**
+▶ **[观看 96 秒产品 Demo（中文配音）](https://synapse.cjlin.com/demo-zh)** · [English version](https://synapse.cjlin.com/demo-en)
 
 ---
 
@@ -63,11 +63,27 @@ npm run dev      # http://localhost:3000
 
 ### 环境变量（`.env.local`）
 
+只填 fucheers 这几个变量,项目就能跑起来——openai / anthropic 都是可选的,从来不是必需的。
+
 ```
-# 主对话 + 所有 L1/L2/L3 抽取 + Aha 合成
+# ── 对话/流水线 LLM 后端 ──────────────────────────────────
+LLM_PROVIDER=fucheers        # fucheers | openai | anthropic
+
+# fucheers（默认，项目运行必需）
 ANTHROPIC_BASE_URL=https://你的-claude-代理/
 ANTHROPIC_API_KEY=sk-xxx
 ANTHROPIC_MODEL=claude-sonnet-4-6
+
+# openai（可选——只有 LLM_PROVIDER=openai 或在界面里手动选择时才会用到）
+OPENAI_API_KEY=
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=gpt-4o
+
+# anthropic 直连（可选——单独一套变量，避免跟上面被 fucheers 复用的
+# ANTHROPIC_* 冲突）
+ANTHROPIC_DIRECT_API_KEY=
+ANTHROPIC_DIRECT_MODEL=claude-sonnet-4-6
+ANTHROPIC_DIRECT_BASE_URL=
 
 # Deep Research（用户主动触发）
 MIROMIND_BASE_URL=https://api.miromind.ai/v1
@@ -86,7 +102,7 @@ TDAI_DATA_DIR=/你的/synapse-data路径
 ┌─────────────────── 浏览器（Client）─────────────────────┐
 │                                                          │
 │  Sidebar           ChatPanel             AhaModal        │
-│  • 本地文件夹       • useChat hook        • 浮层证据图   │
+│  • 已连接的工具     • useChat hook        • 浮层证据图   │
 │  • 历史发现         • 工具回路 (toolUI)   • xyflow 节点  │
 │  • 记忆 / 场景      • 文件 attach        • 可拖拽       │
 │                                                          │
@@ -105,6 +121,10 @@ TDAI_DATA_DIR=/你的/synapse-data路径
 │  /api/memories       ── 侧栏数据（L0/L1/L2/L3）           │
 │  /api/scene/[name]   ── 场景块详情                        │
 │  /api/insight        ── Deep Research                     │
+│  /api/[transport]    ── MCP server（6 个工具，PAT 鉴权）  │
+│  /api/tools/*        ── 已连接的工具 + 只读归档视图       │
+│  /api/tokens         ── 生成/撤销 MCP 访问令牌            │
+│  /api/hook           ── 提供自动捕获脚本                 │
 │                                                           │
 │  scheduler.notifyTurn  ─→  l1-pipeline                    │
 │        ↓ (≥5 turn 或 flush)        ↓ (≥3 new mem 后)      │
@@ -125,6 +145,8 @@ TDAI_DATA_DIR=/你的/synapse-data路径
 │  • Semantic Scholar / arXiv ── Aha 外部文献补足           │
 └────────────────────────────────────────────────────────────┘
 ```
+
+外部 AI 工具(Claude Code、Codex、Cursor、任何 MCP 客户端)完全不经过浏览器——它们直接通过 MCP 打 `/api/[transport]`，一个 Stop hook(`scripts/hooks/synapse_sync.py`，从 `/api/hook` 下载)每轮结束后把这一轮对话 POST 给 `log_conversation`。完整流程见下面的[连接任何 AI 工具](#连接任何-ai-工具mcp--自动捕获)。
 
 ---
 
@@ -193,6 +215,35 @@ TDAI_DATA_DIR=/你的/synapse-data路径
 
 ---
 
+## 连接任何 AI 工具：MCP + 自动捕获
+
+Synapse 不只是网页聊天——它是一个记忆中枢，任何支持 MCP 的 AI 工具都能读写。Claude Code、Codex、Cursor，或任何其他 MCP 客户端，**只要粘贴一段指令**就能连上，不用手动改配置文件。
+
+**接入方式(账号菜单 → 连接 AI 工具)：**
+
+1. 在界面里生成一个个人访问令牌。
+2. 选择你的工具；Synapse 会生成一段专门针对该工具真实 MCP 配置格式和钩子协议的安装指令(Claude Code 的 `~/.claude/settings.json` Stop hook 和 Codex 的 `[[hooks.Stop.hooks]]` TOML 写法完全不一样——适配器 `lib/mcp-adapters.ts` 认得出这个区别，不会瞎猜)。
+3. 把这段指令粘贴进那个工具的对话里。它会自己注册 MCP server，并下载一个 Stop hook 脚本(`scripts/hooks/synapse_sync.py`，通过 `/api/hook` 公开提供)，每一轮对话结束都会触发一次。
+
+![连接你的 AI 工具弹窗](public/screenshots/mcp-connect-modal.jpg)
+
+**接入之后：**
+
+粘贴进去的那段指令，会像一次普通对话一样在那个工具里自己跑完——注册 MCP server、装好钩子、回复确认：
+
+![Claude Code 收到指令后自动配置](public/screenshots/mcp-auto-capture.jpg)
+
+- 那个工具里每一轮结束的对话都会自动同步到 Synapse，不需要你说"记住这个"。这个钩子每次只发送最后一轮用户↔助手的对话内容(不会发送整段会话记录)，而且它是本地脚本发出的一次普通 HTTP 请求——完全不占用那个 AI 工具自己的模型上下文或 token 用量。
+- 同步过来的对话有自己独立的会话命名空间(`chat_<user>_ext_<source>_<project>`)，会出现在侧边栏的 **已连接的工具** 树里，按 工具 → 项目 → 会话 分层——跟你的网页对话历史分开存放。
+- 点进去会打开一个**只读归档**视图(`/tools/[source]/[project]`)，原样展示那个工具里发生的完整对话。
+- MCP server 还给已连接的 AI 暴露了可以直接调用的工具：`get_context`、`search_memory`、`search_conversations`、`remember`、`log_conversation`、`get_insights`——比如 Claude Code 可以把你的研究上下文拉进一个编程会话，或者你直接跟它说"记住这个"，它就能写进网页聊天也在读的同一份记忆里。
+
+![已连接的工具侧边栏 + 一次同步对话的只读归档](public/screenshots/mcp-connected-archive.jpg)
+
+**搜索**走的是混合检索：本地 `bge-m3` 向量嵌入(通过 `node-llama-cpp`，不依赖外部嵌入 API)和 FTS5 通过 Reciprocal Rank Fusion 融合，精确关键词命中和语义相似的改写说法都能搜到——而且精确短语命中会被加权，排到语义相似但没命中关键词的结果前面。
+
+---
+
 ## 文件同步：仅元数据 + LLM 主动读取
 
 **关键约束**：文件夹同步**不会**自动把文件内容塞进数据库。
@@ -216,10 +267,11 @@ chat 请求 body 只带 metadata（≤5KB）
 | 层 | 选型 | 说明 |
 |---|---|---|
 | 框架 | Next.js 14（App Router） | RSC + Route Handlers |
-| 主对话 LLM | `claude-sonnet-4-6` via OpenAI 兼容代理 | 流式 + tool_call 有 bug，已用 `lib/memory/chat-loop.ts` 手写绕过 |
+| 主对话 LLM | 抽象成 provider 接口(`lib/llm/provider.ts`) | 默认 fucheers(`claude-sonnet-4-6`)，openai/anthropic 都是可选项——项目光用 fucheers 一个 key 就能跑 |
+| 跨工具同步 | Model Context Protocol(`@modelcontextprotocol/sdk`) | 按客户端适配的连接指令 + Stop hook 自动捕获，见[连接任何 AI 工具](#连接任何-ai-工具mcp--自动捕获) |
 | Deep Research LLM | `mirothinker-1-7-deepresearch-mini` | 用户主动触发 |
-| AI SDK | `ai` v6 + `@ai-sdk/openai` v3 | `useChat` + `DefaultChatTransport` |
-| 数据库 | `better-sqlite3` + FTS5 trigram tokenizer | 支持中文全文搜索 |
+| AI SDK | `ai` v6 + `@ai-sdk/openai`/`@ai-sdk/anthropic` v3 | `useChat` + `DefaultChatTransport` |
+| 数据库 + 搜索 | `better-sqlite3` + FTS5 trigram tokenizer + `sqlite-vec` | 混合搜索：本地 `bge-m3` 向量嵌入(`node-llama-cpp`)与 FTS5 通过 RRF 融合 |
 | 图可视化 | `@xyflow/react` v12 | Aha 证据图 |
 | PDF 解析 | `pdfjs-dist` v5 | 浏览器端懒加载 |
 | 外部检索 | Semantic Scholar API + arXiv API | 直接 fetch，无 SDK |

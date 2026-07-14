@@ -1,8 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getToken } from "next-auth/jwt";
+import { BARE_PAGES } from "@/lib/public-pages";
 
+// Paths outside BARE_PAGES that also need to bypass auth: static assets, the
+// static mp4 files the demo pages load (the /demo-en /demo-zh PAGES are in
+// BARE_PAGES, but the video file request itself is a separate path and needs
+// its own bypass or the page loads while the <video> element 401s), and a
+// couple of API routes that authenticate a different way (Bearer PAT, or are
+// meant to be fetched by `curl`/tools instead of a logged-in browser).
 const PUBLIC_PATHS = [
-  "/login",
   "/api/auth",
   // MCP endpoint authenticates via Bearer PAT inside the route (lib/api-tokens),
   // not via NextAuth cookies — terminal clients can't carry those.
@@ -16,11 +22,11 @@ const PUBLIC_PATHS = [
   "/logo-mark.png",
   "/logo-vertical.png",
   "/logo-horizontal.jpg",
+  "/demo",
 ];
 
 function isPublicPath(pathname: string): boolean {
-  // Public marketing landing page lives at the root path.
-  if (pathname === "/") return true;
+  if (pathname === "/login" || (BARE_PAGES as readonly string[]).includes(pathname)) return true;
   return PUBLIC_PATHS.some((path) => pathname === path || pathname.startsWith(`${path}/`));
 }
 
